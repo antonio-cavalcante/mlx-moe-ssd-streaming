@@ -1,4 +1,4 @@
-# mlx-disk-try01
+# mlx-moe-ssd-streaming
 
 Goal: run `mlx-community/Muse-Spark-Open-816B-A42B-3bit` (816B-param MoE, 42B active, 359 GB on disk)
 on a 128 GB Mac by keeping only the dense weights in RAM and **streaming routed experts from SSD on demand**.
