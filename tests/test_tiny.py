@@ -75,34 +75,29 @@ def main():
     try:
         ref = make_checkpoint(tmp)
 
-        def stream(cache_experts, group_max, prefetch_k=0):
-            m, c = es.build_streaming_model(tmp, ms, cache_gb=0.0, group_max=group_max,
+        def stream(slots, group_max, prefetch_k=0):
+            return es.build_streaming_model(tmp, ms, slots_per_layer=slots, group_max=group_max,
                                             prefetch_k=prefetch_k, verbose=False)
-            c.capacity = cache_experts
-            return m, c
 
-        # lazy build: experts must not be resident
         mx.clear_cache()
-        before = mx.get_active_memory()
-        m, c = stream(10**6, 48)
-        resident_mb = (mx.get_active_memory() - before) / 2**20
-        expert_total_mb = (CFG["num_hidden_layers"] * CFG["num_local_experts"]
-                           * c.store.expert_bytes) / 2**20
-        print(f"resident after build {resident_mb:.1f} MB; all experts would be {expert_total_mb:.1f} MB")
+        m, c = stream(16, 48)
+        print(f"all experts would be {CFG['num_hidden_layers'] * CFG['num_local_experts'] * c.store.expert_bytes / 2**20:.1f} MB; "
+              f"slabs {c.capacity} experts")
 
         prompt = np.random.RandomState(1).randint(0, 512, 40).tolist()
 
-        # 1. prefill (many tokens -> sorted path, multi-group path with group_max=4)
+        # 1. prefill (many tokens -> stacked path; multi-group path with group_max=4)
         for gm in (48, 4):
-            m, c = stream(10**6, gm)
+            m, c = stream(16, gm)
             ok &= check(f"prefill 40 tok, group_max={gm}", logits(ref, prompt), logits(m, prompt))
 
-        # 2. greedy decode with KV cache, tiny cache (forces eviction) vs unlimited
-        for cap, pf in ((10**6, 0), (6, 0), (10**6, 6), (12, 6), (12, 16)):
-            m, c = stream(cap, 48, pf)
+        # 2. greedy decode with KV cache. slots/layer: 16 = everything fits, 6 = eviction,
+        #    4 = exactly top-k, 3 = fewer slots than a token needs (stacked fallback)
+        for slots, pf in ((16, 0), (6, 0), (4, 0), (3, 0), (16, 6), (6, 6), (6, 16), (4, 4)):
+            m, c = stream(slots, 48, pf)
             rc, sc = ref.make_cache(), m.make_cache()
             lr, ls = logits(ref, prompt, rc), logits(m, prompt, sc)
-            ok &= check(f"cache={cap} prefetch={pf}: prefill with cache", lr, ls)
+            ok &= check(f"slots={slots} prefetch={pf}: prefill with cache", lr, ls)
             toks_r, toks_s = [], []
             for _ in range(8):
                 tr, ts = int(mx.argmax(lr[0, -1])), int(mx.argmax(ls[0, -1]))
@@ -110,14 +105,15 @@ def main():
                 lr, ls = logits(ref, [tr], rc), logits(m, [ts], sc)
             same = toks_r == toks_s
             ok &= same
-            print(f"  {'PASS' if same else 'FAIL'}  cache={cap} prefetch={pf}: greedy tokens ref={toks_r} stream={toks_s}")
-            print("   ", c.summary(), f"| lru size {len(c.lru)}")
-            ok &= len(c.lru) <= cap
-            if pf:
+            print(f"  {'PASS' if same else 'FAIL'}  slots={slots} prefetch={pf}: greedy tokens ref={toks_r} stream={toks_s}")
+            print("   ", c.summary())
+            ok &= c.resident <= c.capacity
+            if pf and slots >= CFG["num_experts_per_tok"]:
                 ok &= c.stats["pf_issued"] > 0
-                print(f"    prefetch issued={c.stats['pf_issued']} used={c.stats['pf_used']} unclaimed={c.stats['pf_wasted']} inflight_left={len(c.inflight)}")
-            elif cap > 100:
+            if slots == 16:
                 ok &= c.stats["hits"] > 0
+            if slots < CFG["num_experts_per_tok"]:
+                ok &= c.stats["fallback"] > 8  # every decode step must take the stacked path
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("ALL PASS" if ok else "FAILURES")
