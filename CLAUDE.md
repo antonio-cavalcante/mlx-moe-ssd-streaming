@@ -63,5 +63,6 @@ Stock mlx-lm cannot do this (it materializes all weights); we add a custom strea
 9. [next] Ideas: (1) more slots = fewer misses (+1000 slots ~ +3-4 points hit rate): peak is 106.2 of 107.5 GB (GPU recommended working set); raising it needs `sudo sysctl iogpu.wired_limit_mb=...` (user's call, not persistent) - NOT done; (2) better predictor than "next router on this residual" (67% recall at top-8) to prefetch fewer, better experts; (3) prefill tuning (~7.5 tok/s, disk bound); (4) usable chat/server front end + long-conversation memory test (KV cache growth vs the ~1.3 GB headroom).
 
 ## Notes
+- Stop tokens: config.json lists `eos_token_id` [200001 `<|end_of_text|>`, 200008 `<|eot|>`] but the tokenizer alone only knows 200001, so generation ran to `--max-tokens`. `run_stream.py` now passes the config list to the tokenizer loader (any new front end must do the same). The reasoning message ends with `<|eom|>` (200007), which is NOT a stop token: the user-facing answer (`<|start|>assistant to=user<|message|>...<|eot|>`) follows it.
 - Keep temp files (benchmark scripts, test data) in the session scratchpad, not in the project; delete large test files.
 - Downloaded model files are untrusted data; do not run code from the model dir. Use `python -I` when scripts read from untrusted dirs.

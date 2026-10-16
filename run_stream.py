@@ -43,7 +43,10 @@ model, cache = es.build_streaming_model(
     args.model, ms, cache_gb=args.cache_gb, group_max=args.group_max,
     nocache=not args.page_cache, threads=args.threads, reserve_gb=args.reserve_gb,
     prefetch_k=args.prefetch_k, prefetch_threads=args.pf_threads, layer_weights=layer_weights)
-tok = load_tokenizer(Path(args.model))
+# The tokenizer only knows <|end_of_text|>; the model ends a turn with <|eot|>. Both are in config.json.
+cfg = json.loads((Path(args.model) / "config.json").read_text())
+eos = cfg.get("eos_token_id") or cfg.get("text_config", {}).get("eos_token_id")
+tok = load_tokenizer(Path(args.model), eos_token_ids=[eos] if isinstance(eos, int) else eos)
 
 prompt = args.prompt
 if not args.raw and getattr(tok, "chat_template", None):
