@@ -27,9 +27,10 @@ class Turn:
     generation_tokens: int
     prompt_s: float          # time to the first generated token
     generation_tps: float
-    finish: str              # "stop", "length" or "interrupted"
+    finish: str              # "stop", "length" or "interrupted" (Ctrl-C or cancelled)
     context: int             # tokens in the cache afterwards
     rebuilt: bool            # the cache had to be rebuilt from the messages first
+    reused: int = 0          # tokens that were already in the cache and not fed again
 
 
 class ChatSession:
@@ -51,6 +52,13 @@ class ChatSession:
         self.cache = self.model.make_cache()
         self.history = []                     # token ids whose keys/values are in the cache
         self._dirty = False
+        self._head = None                     # the system prompt the cache was built under
+
+    def restore(self, messages, reasoning_effort=None):
+        """Adopt a conversation sent by a stateless client; the cache is rebuilt on the next send()."""
+        self.reset(reasoning_effort)
+        self.messages = [dict(m) for m in messages]
+        self._dirty = bool(self.messages)
 
     @property
     def context(self):
@@ -60,16 +68,27 @@ class ChatSession:
         return self.tok.apply_chat_template(messages, add_generation_prompt=generation, tokenize=False,
                                             reasoning_effort=self.effort)
 
-    def send(self, text, on_chunks=None, max_tokens=2048):
-        """Run one turn. `on_chunks([(channel, text), ...])` gets the reasoning/answer text as it streams."""
+    def _system_prompt(self, messages):
+        """The rendered system block (it holds the effort and the date, so it can change under the cache)."""
+        lead = messages[:1] if messages and messages[0]["role"] in ("system", "developer") else []
+        return self._render(lead + [{"role": "user", "content": ""}], False)   # (a template needs a message)
+
+    def send(self, text, on_chunks=None, max_tokens=2048, cancel=None):
+        """Run one turn. `on_chunks([(channel, text), ...])` gets the reasoning/answer text as it streams.
+        `cancel()` is polled after every token; when it returns True the turn ends early."""
         rebuilt = self._dirty
         if self._dirty:
             self.cache, self.history, self._dirty = self.model.make_cache(), [], False
         user = {"role": "user", "content": text}
         prev = self._render(self.messages, False) if self.history else ""
         full = self._render(self.messages + [user], True)
-        if not full.startswith(prev):
-            raise RuntimeError("the chat template does not extend the earlier conversation as a prefix")
+        head = self._system_prompt(self.messages)
+        if self.history and (head != self._head or not full.startswith(prev)):
+            # the system prompt changed under the cache (reasoning effort, or the date): start over
+            self.cache, self.history, rebuilt, prev = self.model.make_cache(), [], True, ""
+        if not self.history:
+            self._head = head
+        reused = len(self.history)
         ids = self.tok.encode(full[len(prev):], add_special_tokens=False)
         if self.history and self.history[-1] not in self.eos:
             ids = [self.eot] + ids            # the previous turn was cut short: close it first
@@ -97,8 +116,12 @@ class ChatSession:
                 gen.append(resp.token)
                 last = resp
                 emit(parser.feed(resp.text))
+                if cancel and cancel():
+                    finish = "interrupted"
+                    break
             emit(parser.flush())
-            finish = last.finish_reason if last and last.finish_reason else "stop"
+            if finish != "interrupted":
+                finish = last.finish_reason if last and last.finish_reason else "stop"
         except KeyboardInterrupt:
             finish = "interrupted"
         answer = "".join(parts["answer"])
@@ -115,4 +138,4 @@ class ChatSession:
         t_end = time.perf_counter()
         gps = last.generation_tps if last else 0.0
         return Turn(answer, "".join(parts["reasoning"]), len(ids), len(gen),
-                    (t_first or t_end) - t0, gps, finish, self.context, rebuilt)
+                    (t_first or t_end) - t0, gps, finish, self.context, rebuilt, reused)

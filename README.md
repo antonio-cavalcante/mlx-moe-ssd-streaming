@@ -113,12 +113,44 @@ The sliding-window attention layers cannot be rewound once they wrap, so the cac
 the model's own reasoning from earlier turns stays in the context. If the cache state is ever in
 doubt (for example Ctrl-C in the middle of a step) it is rebuilt from the stored messages.
 
+## Server
+
+```bash
+.venv/bin/python serve.py            # http://127.0.0.1:8000/v1
+```
+
+An OpenAI-compatible endpoint (`POST /v1/chat/completions`, blocking or `"stream": true`, and
+`GET /v1/models`), so existing clients work: point them at `http://127.0.0.1:8000/v1` with any API key.
+It was checked with the official `openai` Python client.
+
+- **One conversation is cached.** The API is stateless (the client resends the history) but the model is not:
+  when a request is the stored conversation plus one new user message, only the new tokens are processed
+  (`usage.prompt_tokens_details.cached_tokens` shows the reuse; a 10-token follow-up reached its first
+  token in about 2-3 s). Any other conversation, a changed system prompt or a changed `reasoning_effort`
+  is rebuilt from scratch, which costs a full prefill (about 25 s for a short prompt, ~50-70 tok/s for long ones).
+  Alternating between two conversations therefore rebuilds every time.
+- **Reasoning.** `message.content` is the answer only; the model's reasoning comes in
+  `message.reasoning_content` (and as `reasoning_content` deltas when streaming), which several clients show.
+  `--hide-reasoning` drops it. Reasoning counts toward `max_tokens` (default `--max-tokens 4096`): a small
+  `max_tokens` can be used up before the answer starts.
+- **Supported:** `messages` (system/developer first, user, assistant; text only), `max_tokens` /
+  `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `reasoning_effort` (`low`, `medium`, `high`,
+  `xhigh`), `stream`, `stream_options.include_usage`. Defaults for sampling come from the model's own
+  `generation_config.json`. A client that disconnects mid-reply stops the generation.
+- **Not supported** (a clear 400): tools / function calling, images and audio, `n > 1`, `logprobs`,
+  `response_format` other than text. `stop`, penalties and `seed` are ignored.
+- **Requests are served one at a time**, in order (one GPU, one cache).
+- **Access:** it listens on 127.0.0.1 only. `--host 0.0.0.0` exposes the model to your network: add
+  `--api-key KEY` if you do. CORS headers are off; `--cors-origin ORIGIN` allows one browser origin.
+  The model license asks that products built on it say "Built with Muse Spark Open".
+
 ## Tests
 
 ```bash
 .venv/bin/python -I tests/test_tiny.py
 .venv/bin/python -I tests/test_turns.py
 .venv/bin/python -I tests/test_chat.py
+.venv/bin/python -I tests/test_server.py
 ```
 
 Builds a tiny 3-bit checkpoint (2 shards, the real tensor names) and checks that the
@@ -127,7 +159,8 @@ slab sizes (larger than, equal to, and smaller than a token's expert count), evi
 prefetch. `test_turns.py` checks the reasoning/answer splitter. `test_chat.py` runs multi-turn sessions on a
 tiny float32 checkpoint and checks that the incremental KV cache gives the same logits as a fresh
 prefill of the same tokens (including a wrapped sliding window, a cut-short turn and a cache rebuild).
-None of them needs the real model.
+`test_server.py` runs the HTTP layer against a scripted session (matching, streaming format, errors,
+API key, client disconnect) and end to end on the tiny checkpoint. None of them needs the real model.
 
 ## Layout
 
@@ -140,9 +173,12 @@ None of them needs the real model.
 | `src/cli_common.py` | arguments, model loading and output helpers shared by the two programs |
 | `run_stream.py` | one-shot generation with timing and cache statistics |
 | `chat.py` | interactive chat |
+| `src/openai_server.py` | OpenAI-compatible HTTP server logic on top of `ChatSession` |
+| `serve.py` | starts the server |
 | `tests/test_tiny.py` | correctness test on a tiny synthetic checkpoint |
 | `tests/test_turns.py` | unit test for the reasoning/answer splitter |
 | `tests/test_chat.py` | multi-turn KV-cache correctness on a tiny checkpoint |
+| `tests/test_server.py` | server tests (scripted session + tiny checkpoint) |
 | `meta/layer_weights.json` | per-layer slab sizing, measured from sampled decode traces |
 | `CLAUDE.md` | development log / project notes |
 

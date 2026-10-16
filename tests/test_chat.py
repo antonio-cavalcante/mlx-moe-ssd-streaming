@@ -99,6 +99,30 @@ def main():
         print(f"  {'PASS' if t.rebuilt else 'FAIL'}  dirty cache is rebuilt ({t.prompt_tokens} tokens re-fed)")
         ok &= last_logits_match("rebuilt: cache == fresh prefill", ref, s2)
 
+        # cancelled after two tokens: the cache stays consistent and usable
+        s4 = cs.ChatSession(model, tok, max_context=400, small_step=4, small_below=30)
+        n = []
+        t = s4.send("hello", on_chunks=None, max_tokens=20, cancel=lambda: n.append(1) or len(n) >= 2)
+        ok &= t.finish == "interrupted" and t.generation_tokens == 2 and {c.offset for c in s4.cache} == {s4.context}
+        print(f"  {'PASS' if t.finish == 'interrupted' else 'FAIL'}  cancel() stops after {t.generation_tokens} tokens, "
+              f"cache consistent ({s4.context})")
+        ok &= last_logits_match("after cancel: cache == fresh prefill", ref, s4)
+        s4.send("go on", max_tokens=3)
+        ok &= last_logits_match("turn after a cancel: cache == fresh prefill", ref, s4)
+
+        # the system prompt changes (effort here; the date in the real template): rebuilt, not an error
+        s4.effort = "high"
+        t = s4.send("one more", max_tokens=3)
+        ok &= t.rebuilt and t.reused == 0
+        print(f"  {'PASS' if t.rebuilt and t.reused == 0 else 'FAIL'}  changed system prompt -> rebuilt from the messages")
+        ok &= last_logits_match("after prefix change: cache == fresh prefill", ref, s4)
+
+        # restore(): adopt a client's conversation, rebuild lazily
+        s4.restore([{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}], "low")
+        t = s4.send("c", max_tokens=3)
+        ok &= t.rebuilt and len(s4.messages) == 4 and s4.effort == "low"
+        ok &= last_logits_match("after restore: cache == fresh prefill", ref, s4)
+
         # context limit
         s3 = cs.ChatSession(model, tok, max_context=40)
         try:
