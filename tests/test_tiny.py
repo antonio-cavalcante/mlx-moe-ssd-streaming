@@ -75,9 +75,9 @@ def main():
     try:
         ref = make_checkpoint(tmp)
 
-        def stream(cache_experts, group_max):
+        def stream(cache_experts, group_max, prefetch_k=0):
             m, c = es.build_streaming_model(tmp, ms, cache_gb=0.0, group_max=group_max,
-                                            verbose=False)
+                                            prefetch_k=prefetch_k, verbose=False)
             c.capacity = cache_experts
             return m, c
 
@@ -98,11 +98,11 @@ def main():
             ok &= check(f"prefill 40 tok, group_max={gm}", logits(ref, prompt), logits(m, prompt))
 
         # 2. greedy decode with KV cache, tiny cache (forces eviction) vs unlimited
-        for cap in (10**6, 6):
-            m, c = stream(cap, 48)
+        for cap, pf in ((10**6, 0), (6, 0), (10**6, 6), (12, 6), (12, 16)):
+            m, c = stream(cap, 48, pf)
             rc, sc = ref.make_cache(), m.make_cache()
             lr, ls = logits(ref, prompt, rc), logits(m, prompt, sc)
-            ok &= check(f"cache={cap}: prefill with cache", lr, ls)
+            ok &= check(f"cache={cap} prefetch={pf}: prefill with cache", lr, ls)
             toks_r, toks_s = [], []
             for _ in range(8):
                 tr, ts = int(mx.argmax(lr[0, -1])), int(mx.argmax(ls[0, -1]))
@@ -110,11 +110,13 @@ def main():
                 lr, ls = logits(ref, [tr], rc), logits(m, [ts], sc)
             same = toks_r == toks_s
             ok &= same
-            print(f"  {'PASS' if same else 'FAIL'}  cache={cap}: greedy tokens ref={toks_r} stream={toks_s}")
+            print(f"  {'PASS' if same else 'FAIL'}  cache={cap} prefetch={pf}: greedy tokens ref={toks_r} stream={toks_s}")
             print("   ", c.summary(), f"| lru size {len(c.lru)}")
-            if cap == 6:
-                ok &= len(c.lru) <= 6
-            else:
+            ok &= len(c.lru) <= cap
+            if pf:
+                ok &= c.stats["pf_issued"] > 0
+                print(f"    prefetch issued={c.stats['pf_issued']} used={c.stats['pf_used']} unclaimed={c.stats['pf_wasted']} inflight_left={len(c.inflight)}")
+            elif cap > 100:
                 ok &= c.stats["hits"] > 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
