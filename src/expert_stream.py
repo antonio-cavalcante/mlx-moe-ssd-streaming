@@ -61,8 +61,14 @@ def read_safetensors_header(path):
 class ExpertStore:
     """Reads single experts (9 tensors each) out of the safetensors shards."""
 
-    def __init__(self, model_dir, num_layers, num_experts, nocache=True, threads=24):
+    def __init__(self, model_dir, num_layers, num_experts, nocache=True, threads=24,
+                 chunk_mb=1.0, direct=True):
         self.num_layers, self.num_experts = num_layers, num_experts
+        # direct: pread straight into the final MLX buffers (no host copy).
+        # chunk_mb: split each tensor read into pieces of this size so more reads are
+        # in flight (0 = one read per tensor).
+        self.direct = direct
+        self.chunk = int(chunk_mb * (1 << 20)) if chunk_mb else 0
         self.loc = {}  # (layer, proj, kind) -> (fd, base, stride, dtype, shape_tail)
         self.fds = []
         for path in sorted(glob.glob(str(Path(model_dir) / "model*.safetensors"))):
@@ -95,8 +101,38 @@ class ExpertStore:
             raise IOError(f"short read ({got}/{stride}) layer {layer} expert {expert} {piece}")
         return buf
 
+    def _fill(self, fd, off, view):
+        """preadv until `view` (a writable uint8 buffer) is full."""
+        done = 0
+        while done < len(view):
+            got = os.preadv(fd, [memoryview(view)[done:]], off + done)
+            if got <= 0:
+                raise IOError(f"short read at offset {off + done}")
+            done += got
+
     def read_many(self, layer, experts):
         """Parallel read; returns {expert: tuple of 9 mx.arrays in PIECES order}."""
+        if not self.direct:
+            return self._read_many_copy(layer, experts)
+        slots = [(e, i) for e in experts for i in range(len(PIECES))]
+        raws = {s: mx.zeros((self.loc[(layer,) + PIECES[s[1]]][2],), dtype=mx.uint8)
+                for s in slots}
+        mx.eval(list(raws.values()))
+        tasks = []
+        for (e, i), raw in raws.items():
+            fd, base, stride, _, _ = self.loc[(layer,) + PIECES[i]]
+            view = np.frombuffer(memoryview(raw), dtype=np.uint8)
+            step = self.chunk or stride
+            for o in range(0, stride, step):
+                tasks.append((fd, base + e * stride + o, view[o:o + step]))
+        list(self.pool.map(lambda t: self._fill(*t), tasks))
+        out = {}
+        for (e, i), raw in raws.items():
+            _, _, _, dtype, tail = self.loc[(layer,) + PIECES[i]]
+            out.setdefault(e, []).append(raw.view(_MX_DTYPE[dtype]).reshape(tail))
+        return {e: tuple(v) for e, v in out.items()}
+
+    def _read_many_copy(self, layer, experts):
         jobs = [(e, i) for e in experts for i in range(len(PIECES))]
         bufs = list(self.pool.map(lambda j: self._read(layer, j[0], PIECES[j[1]]), jobs))
         out = {}
