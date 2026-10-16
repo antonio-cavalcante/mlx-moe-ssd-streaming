@@ -76,7 +76,11 @@ Tested with mlx 0.32.4 and mlx-lm 0.32.2 (from `main`).
 Useful flags: `--cache-gb` (expert slab size; default: the GPU working-set limit minus the
 resident weights minus `--reserve-gb`), `--reserve-gb` (headroom for the KV cache and
 temporaries, default 10), `--prefetch-k`, `--threads`, `--layer-weights equal`.
-The model is a reasoning model: expect its chain of thought before the answer.
+The model is a reasoning model: it thinks before it answers, and generation stops by itself when
+the answer is done. The answer goes to stdout; the reasoning (dimmed on a terminal) and the
+statistics go to stderr, so `> answer.txt` keeps only the answer. `--reasoning-effort low|medium|high|xhigh`
+sets how long it thinks (default is the chat template's, `xhigh`), `--hide-reasoning` drops it, and
+`--show-markup` prints the raw token stream.
 
 Lower `--cache-gb` if you need more free memory; it trades speed for headroom.
 
@@ -84,12 +88,13 @@ Lower `--cache-gb` if you need more free memory; it trades speed for headroom.
 
 ```bash
 .venv/bin/python -I tests/test_tiny.py
+.venv/bin/python -I tests/test_turns.py
 ```
 
 Builds a tiny 3-bit checkpoint (2 shards, the real tensor names) and checks that the
 streaming model matches the stock in-memory model for prefill and greedy decoding, across
 slab sizes (larger than, equal to, and smaller than a token's expert count), eviction, and
-prefetch. It does not need the real model.
+prefetch. `test_turns.py` checks the reasoning/answer splitter. Neither needs the real model.
 
 ## Layout
 
@@ -97,8 +102,10 @@ prefetch. It does not need the real model.
 |---|---|
 | `src/expert_stream.py` | the streaming layer: `ExpertStore`, `ExpertCache` (slabs + LRU + prefetch), `StreamingSwitchGLU`, `build_streaming_model` |
 | `src/muse_spark_1975.py` | vendored model code (see below) |
+| `src/turns.py` | splits the streamed text into reasoning and answer |
 | `run_stream.py` | command-line generation with timing and cache statistics |
 | `tests/test_tiny.py` | correctness test on a tiny synthetic checkpoint |
+| `tests/test_turns.py` | unit test for the reasoning/answer splitter |
 | `meta/layer_weights.json` | per-layer slab sizing, measured from sampled decode traces |
 | `CLAUDE.md` | development log / project notes |
 

@@ -29,6 +29,7 @@ import json
 import os
 import re
 import struct
+import sys
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -496,5 +497,5 @@ def build_streaming_model(model_dir, model_module, cache_gb=None, slots_per_laye
         print(f"resident {resident / GB:.1f} GB, expert slabs {cache.capacity * store.expert_bytes / GB:.1f} GB "
               f"({cache.capacity} of {total} experts, {min(cache.slots)}-{max(cache.slots)} per layer, "
               f"{store.expert_bytes / 2**20:.1f} MB each)"
-              + (f", prefetch top-{prefetch_k}" if prefetch_k else ""), flush=True)
+              + (f", prefetch top-{prefetch_k}" if prefetch_k else ""), file=sys.stderr, flush=True)
     return model, cache
