@@ -22,7 +22,7 @@ Apple M5 Max, 128 GB unified memory, internal SSD, macOS. One 200-token generati
 | Prompt processing | ~7.5 tokens/s (disk-bound) |
 | Resident dense weights | 9.0 GB |
 | Expert cache (slabs) | 87.8 GB = 4,280 of 15,872 experts (27%) |
-| Peak memory | 106.2 GB (GPU recommended working set: 107.5 GB) |
+| Peak memory | 98.9 GB (GPU recommended working set: 107.5 GB) |
 | Decode cache hit rate | ~89% |
 
 These are single-machine, short-run numbers, not a benchmark suite. Speed depends on your
@@ -45,6 +45,11 @@ log: what was measured, what helped, and what did not.
   (`--prefetch-k`, default 4; about 67% recall at top-8).
 - **Prefill** (many tokens, nearly every expert needed) reads each group of experts into
   temporary buffers and never evicts the decode working set.
+
+## Units
+
+Sizes printed by this repo (and quoted here) are GB = 2^30 bytes (GiB), the unit the GPU limit is reported in.
+mlx-lm's own `peak_memory` field is in decimal GB (1e9 bytes), about 7% larger.
 
 ## Requirements
 
@@ -79,22 +84,50 @@ temporaries, default 10), `--prefetch-k`, `--threads`, `--layer-weights equal`.
 The model is a reasoning model: it thinks before it answers, and generation stops by itself when
 the answer is done. The answer goes to stdout; the reasoning (dimmed on a terminal) and the
 statistics go to stderr, so `> answer.txt` keeps only the answer. `--reasoning-effort low|medium|high|xhigh`
-sets how long it thinks (default is the chat template's, `xhigh`), `--hide-reasoning` drops it, and
-`--show-markup` prints the raw token stream.
+sets how long it thinks (default `medium`; the chat template's own default is `xhigh`), `--hide-reasoning` drops it, and
+`--show-markup` prints the raw token stream. Output is greedy by default; `--temp`, `--top-k` and `--top-p` sample.
 
 Lower `--cache-gb` if you need more free memory; it trades speed for headroom.
+
+## Chat
+
+```bash
+.venv/bin/python chat.py
+```
+
+A multi-turn conversation that keeps its KV cache between turns, so each message only
+processes its own new tokens. Commands: `/reset`, `/effort low|medium|high|xhigh`, `/context`,
+`/stats`, `/quit`, and `"""` to start and end a multi-line message; Ctrl-C stops an answer.
+Sampling defaults to the model's own recommendation (`generation_config.json`: temperature 1,
+top-k 64). `--max-context` (default 16384 tokens) limits the conversation; the KV cache costs
+about 64 KB per token.
+
+Measured on the M5 Max (reasoning effort low): an 11,000-token conversation built from three
+pasted source files peaked at 100.2 GB of the 107.5 GB limit (about 7 GB of headroom), decoded at 3.6-4.3 tok/s, and still
+recalled the first file. A big prefill runs at about 50-70 tok/s (4,500 tokens in 70-90 s); the first
+message of a session pays about 25 s for the system prompt. Short follow-up messages are fed in
+groups of 8 tokens through the cached decode path, which beat one big prefill chunk (6.2 s vs 8.9 s
+to the first token for a 35-token message).
+
+The sliding-window attention layers cannot be rewound once they wrap, so the cache is append-only:
+the model's own reasoning from earlier turns stays in the context. If the cache state is ever in
+doubt (for example Ctrl-C in the middle of a step) it is rebuilt from the stored messages.
 
 ## Tests
 
 ```bash
 .venv/bin/python -I tests/test_tiny.py
 .venv/bin/python -I tests/test_turns.py
+.venv/bin/python -I tests/test_chat.py
 ```
 
 Builds a tiny 3-bit checkpoint (2 shards, the real tensor names) and checks that the
 streaming model matches the stock in-memory model for prefill and greedy decoding, across
 slab sizes (larger than, equal to, and smaller than a token's expert count), eviction, and
-prefetch. `test_turns.py` checks the reasoning/answer splitter. Neither needs the real model.
+prefetch. `test_turns.py` checks the reasoning/answer splitter. `test_chat.py` runs multi-turn sessions on a
+tiny float32 checkpoint and checks that the incremental KV cache gives the same logits as a fresh
+prefill of the same tokens (including a wrapped sliding window, a cut-short turn and a cache rebuild).
+None of them needs the real model.
 
 ## Layout
 
@@ -103,9 +136,13 @@ prefetch. `test_turns.py` checks the reasoning/answer splitter. Neither needs th
 | `src/expert_stream.py` | the streaming layer: `ExpertStore`, `ExpertCache` (slabs + LRU + prefetch), `StreamingSwitchGLU`, `build_streaming_model` |
 | `src/muse_spark_1975.py` | vendored model code (see below) |
 | `src/turns.py` | splits the streamed text into reasoning and answer |
-| `run_stream.py` | command-line generation with timing and cache statistics |
+| `src/chat_session.py` | multi-turn conversation with a persistent KV cache |
+| `src/cli_common.py` | arguments, model loading and output helpers shared by the two programs |
+| `run_stream.py` | one-shot generation with timing and cache statistics |
+| `chat.py` | interactive chat |
 | `tests/test_tiny.py` | correctness test on a tiny synthetic checkpoint |
 | `tests/test_turns.py` | unit test for the reasoning/answer splitter |
+| `tests/test_chat.py` | multi-turn KV-cache correctness on a tiny checkpoint |
 | `meta/layer_weights.json` | per-layer slab sizing, measured from sampled decode traces |
 | `CLAUDE.md` | development log / project notes |
 
@@ -122,9 +159,9 @@ changed. If the checkpoint is reconverted for the merged layout, the vendored fi
 - Developed and measured on one machine and one model. Other Macs and other MoE models are
   untested; the expert-offset logic assumes the stacked `switch_mlp` layout of this
   checkpoint.
-- Peak memory is close to the GPU working-set limit by design. Very long contexts grow the
-  KV cache; reduce `--cache-gb` or raise `--reserve-gb` for them. Long-conversation
-  behavior has not been tested yet.
+- Peak memory is kept below the GPU working-set limit by `--reserve-gb`. Conversations were tested up
+  to about 11,000 tokens (peak 100.2 of 107.5 GB); longer ones grow the KV cache by ~64 KB per token, so
+  reduce `--cache-gb` or raise `--reserve-gb` if you raise `--max-context` a lot.
 - Greedy and sampled output was checked for coherence on a handful of prompts, not
   evaluated for quality.
 

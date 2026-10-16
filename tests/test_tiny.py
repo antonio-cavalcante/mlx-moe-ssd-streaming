@@ -27,7 +27,7 @@ CFG = dict(
 )
 
 
-def make_checkpoint(out: Path):
+def make_checkpoint(out: Path, dtype=mx.bfloat16):
     mx.random.seed(0)
     model = ms.Model(ms.ModelArgs.from_dict(CFG))
     # Randomize everything so routing/norms/gates are non-degenerate.
@@ -37,7 +37,7 @@ def make_checkpoint(out: Path):
     model.update(tree_unflatten(noise))
     keep_fp32 = model.cast_predicate  # router + residual gates stay float32
     model.update(tree_unflatten(
-        [(k, v.astype(mx.bfloat16) if keep_fp32(k) else v)
+        [(k, v.astype(dtype) if keep_fp32(k) else v)
          for k, v in tree_flatten(model.parameters())]))
     q = CFG["quantization"]
     nn.quantize(model, group_size=q["group_size"], bits=q["bits"], mode=q["mode"])
