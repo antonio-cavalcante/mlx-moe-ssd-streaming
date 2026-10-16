@@ -19,7 +19,8 @@ Stock mlx-lm cannot do this (it materializes all weights); we add a custom strea
 - `src/expert_stream.py` - the streaming layer: `ExpertStore` (parses safetensors headers, parallel `preadv` of one expert = 9 tensors by offset, F_NOCACHE), `ExpertCache` (per-layer slabs + LRU, prefetch bookkeeping, stats), `StreamingSwitchGLU` (drop-in for `SwitchGLU`: `mx.eval(inds)` -> slab lookup -> stock SwitchGLU math on a template whose weights ARE the slabs, indices = slot numbers; stacked fallback for prefill), `build_streaming_model()` (dense weights via lazy `mx.load`, strict key check, auto cache size).
 - `tests/test_tiny.py` - builds a tiny 3-bit bf16 checkpoint with the real key names in 2 shards and checks streaming == stock model (prefill, multi-group prefill, greedy decode, tiny cache with eviction). Run: `.venv/bin/python -I tests/test_tiny.py` (all pass as of 2026-10-15).
 - `run_stream.py` - CLI generation with the real model (`--prompt`, `--max-tokens`, `--cache-gb`, `--threads`, `--page-cache`); prints tok/s and cache stats.
-- `meta/` - `config.json`, `model.safetensors.index.json`, `tensors.json` (name -> [bytes, shape, dtype, shard]) fetched from the HF repo headers.
+- `meta/` - `layer_weights.json` is tracked (our own measurement). `config.json`, `model.safetensors.index.json`, `tensors.json` (name -> [bytes, shape, dtype, shard]) are LOCAL ONLY (gitignored: copies/derivatives of the model's own files, covered by the Muse Model License); regenerate with `hf download` (config/index) and `HfApi().get_safetensors_metadata`.
+- `README.md`, `LICENSE` (MIT, code of this repo), `THIRD_PARTY_NOTICES.md` (vendored mlx-lm file under MIT; the model is NOT redistributed and has its own license: must show "Built with Muse Spark Open" in docs/UI, follow the Usage Policy).
 - `logs/` - download and run logs.
 
 ## Model facts (from config + tensor headers)

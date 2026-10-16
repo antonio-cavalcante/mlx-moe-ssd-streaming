@@ -5,3 +5,8 @@ logs/
 __pycache__/
 *.pyc
 .DS_Store
+
+# copies/derivatives of the model's own files (covered by its license); regenerate, do not commit
+meta/config.json
+meta/model.safetensors.index.json
+meta/tensors.json
