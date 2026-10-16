@@ -2,17 +2,25 @@
 
 Only the dense weights (attention, embeddings, routers, pre/post expert projections,
 norms) are loaded into memory. For every MoE layer the router runs first, then just the
-selected experts are read from the original safetensors shards (by byte offset) into an
-LRU cache and the usual gate/up/down SwiGLU runs on them.
+selected experts are read from the original safetensors shards (by byte offset) and the
+usual gate/up/down SwiGLU runs on them.
+
+Expert cache = one slab per layer: for each of the 9 expert tensors an array
+[slots, *tail] whose rows are expert slots, plus a per-layer LRU that maps expert -> slot.
+Disk reads land directly in a slot (writable memoryview of the MLX buffer, split into
+parallel chunks) and the GPU reads experts in place through gather_qmm slot indices, so
+there is no per-token copy/stack of expert weights.
 
 Expert tensors are stacked in the checkpoint with the expert index as the leading axis,
 so expert `e` of a tensor with shape [E, a, b] is the contiguous byte range
-[base + e*stride, base + (e+1)*stride) of the shard file. Reads go straight into the
-final MLX buffers (writable memoryview), split into chunks that run in parallel.
+[base + e*stride, base + (e+1)*stride) of the shard file.
+
+Prefill (many tokens, many distinct experts) does not use the slabs for new data: it reads
+each group of experts into temporary buffers, stacks them and discards them.
 
 Optional prefetch (enable_prefetch): while layer l's expert math runs on the GPU, the
 experts layer l+1 will probably need (layer l+1's router applied to layer l's residual
-stream) are already being read in the background.
+stream) are already being read into free/oldest slots in the background.
 """
 
 import fcntl
@@ -62,15 +70,6 @@ def read_safetensors_header(path):
     return out
 
 
-class _Pending:
-    """An expert whose 9 tensors are being read into `raws` by worker threads."""
-
-    __slots__ = ("raws", "futures")
-
-    def __init__(self):
-        self.raws, self.futures = [], []
-
-
 class ExpertStore:
     """Reads single experts (9 tensors each) out of the safetensors shards."""
 
@@ -85,7 +84,7 @@ class ExpertStore:
         for path in sorted(glob.glob(str(Path(model_dir) / "model*.safetensors"))):
             fd = os.open(path, os.O_RDONLY)
             if nocache:
-                # Our own LRU is the cache; don't let the OS page cache double-buffer.
+                # Our own slabs are the cache; don't let the OS page cache double-buffer.
                 fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
             self.fds.append(fd)
             for name, (off, nbytes, dtype, shape) in read_safetensors_header(path).items():
@@ -102,7 +101,6 @@ class ExpertStore:
         if missing:
             raise FileNotFoundError(f"{len(missing)} expert tensors missing, e.g. {missing[0]}")
         self.expert_bytes = sum(self.loc[(0, p, k)][2] for p, k in PIECES)
-        self.free = {}  # nbytes -> recycled uint8 buffers (fully overwritten by each read)
         self.pool = ThreadPoolExecutor(threads)  # demand reads
         self.pf_pool = ThreadPoolExecutor(prefetch_threads)  # speculative reads
 
@@ -115,166 +113,185 @@ class ExpertStore:
                 raise IOError(f"short read at offset {off + done}")
             done += got
 
-    def start_read(self, layer, experts, pool=None, chunk=None):
-        """Allocate buffers and queue the reads without waiting: {expert: _Pending}."""
-        pool = pool or self.pool
+    def fill_slot(self, layer, expert, views, slot, pool, chunk=None):
+        """Queue reads of one expert's 9 tensors into row `slot` of the layer's slab
+        (`views[i]` = flat writable uint8 view of tensor i's slab). Returns the futures."""
         chunk = self.chunk if chunk is None else chunk
-        raws, fresh = {}, []
-        for e in experts:
-            for i in range(len(PIECES)):
-                n = self.loc[(layer,) + PIECES[i]][2]
-                spare = self.free.get(n)
-                if spare:
-                    raws[(e, i)] = spare.pop()
-                else:
-                    raws[(e, i)] = mx.zeros((n,), dtype=mx.uint8)
-                    fresh.append(raws[(e, i)])
-        if fresh:
-            mx.eval(fresh)
-        out = {}
-        for e in experts:
-            p = out[e] = _Pending()
-            for i in range(len(PIECES)):
-                raw = raws[(e, i)]
-                fd, base, stride, _, _ = self.loc[(layer,) + PIECES[i]]
-                view = np.frombuffer(memoryview(raw), dtype=np.uint8)
-                step = chunk or stride
-                p.raws.append(raw)
-                p.futures.extend(pool.submit(self._fill, fd, base + e * stride + o, view[o:o + step])
-                                 for o in range(0, stride, step))
-        return out
+        futs = []
+        for i in range(len(PIECES)):
+            fd, base, stride, _, _ = self.loc[(layer,) + PIECES[i]]
+            view = views[i][slot * stride:(slot + 1) * stride]
+            step = chunk or stride
+            futs.extend(pool.submit(self._fill, fd, base + expert * stride + o, view[o:o + step])
+                        for o in range(0, stride, step))
+        return futs
 
-    def recycle(self, raws):
-        for r in raws:
-            self.free.setdefault(r.nbytes, []).append(r)
-
-    @staticmethod
-    def done(p):
-        return all(f.done() for f in p.futures)
-
-    def finish(self, layer, p):
-        """Wait for a pending expert; returns its 9 mx.arrays in PIECES order."""
-        for f in p.futures:
+    def read_temp(self, layer, experts):
+        """Blocking read of whole experts into fresh buffers: {expert: 9 mx.arrays}."""
+        raws = {(e, i): mx.zeros((self.loc[(layer,) + PIECES[i]][2],), dtype=mx.uint8)
+                for e in experts for i in range(len(PIECES))}
+        mx.eval(list(raws.values()))
+        futs = []
+        for (e, i), raw in raws.items():
+            fd, base, stride, _, _ = self.loc[(layer,) + PIECES[i]]
+            view = np.frombuffer(memoryview(raw), dtype=np.uint8)
+            step = self.chunk or stride
+            futs.extend(self.pool.submit(self._fill, fd, base + e * stride + o, view[o:o + step])
+                        for o in range(0, stride, step))
+        for f in futs:
             f.result()
-        arrs = []
-        for i, raw in enumerate(p.raws):
+        out = {}
+        for (e, i), raw in raws.items():
             _, _, _, dtype, tail = self.loc[(layer,) + PIECES[i]]
-            arrs.append(raw.view(_MX_DTYPE[dtype]).reshape(tail))
-        return tuple(arrs)
-
-    def read_many(self, layer, experts):
-        """Blocking parallel read; returns {expert: (9 mx.arrays, raw buffers)}."""
-        pend = self.start_read(layer, experts)
-        return {e: (self.finish(layer, p), p.raws) for e, p in pend.items()}
+            out.setdefault(e, []).append(raw.view(_MX_DTYPE[dtype]).reshape(tail))
+        return {e: tuple(v) for e, v in out.items()}
 
 
 class ExpertCache:
-    """LRU of (layer, expert) -> 9 mx.arrays, bounded by a byte budget."""
+    """Per-layer slabs of expert slots with a per-layer LRU (expert -> slot)."""
 
-    def __init__(self, store, budget_bytes):
+    def __init__(self, store, slots):
         self.store = store
-        self.capacity = max(0, int(budget_bytes // store.expert_bytes))
-        self.lru = OrderedDict()  # (layer, expert) -> (arrays, raw buffers)
-        self._grave = []  # raw buffers of evicted entries, reusable after the next GPU sync
-        self._dropped = []  # unclaimed speculative reads, reusable once they finish
-        self.inflight = {}  # (layer, expert) -> _Pending, speculative reads in progress
+        L = store.num_layers
+        self.slots = [max(1, int(s)) for s in slots]
+        assert len(self.slots) == L
+        self.arrays, self.views = [], []  # per layer: 9 [slots,*tail] arrays / flat uint8 views
+        for l in range(L):
+            raws, arrs = [], []
+            for i in range(len(PIECES)):
+                _, _, stride, dtype, tail = store.loc[(l,) + PIECES[i]]
+                raws.append(mx.zeros((self.slots[l] * stride,), dtype=mx.uint8))
+            mx.eval(raws)
+            self.views.append([np.frombuffer(memoryview(r), dtype=np.uint8) for r in raws])
+            for i, r in enumerate(raws):
+                _, _, _, dtype, tail = store.loc[(l,) + PIECES[i]]
+                arrs.append(r.view(_MX_DTYPE[dtype]).reshape((self.slots[l],) + tuple(tail)))
+            self.arrays.append(arrs)
+        self.order = [OrderedDict() for _ in range(L)]  # expert -> slot, oldest first
+        self.free = [list(range(n)) for n in self.slots]
+        self.pending = [dict() for _ in range(L)]  # expert -> (slot, futures): prefetch
         self.resid = {}  # layer -> last-token residual stream (set by prefetch hooks)
         self.prefetch_k = 0
-        self.stats = dict(hits=0, misses=0, bytes_read=0, read_s=0.0, stack_s=0.0,
-                          sync_s=0.0, calls=0, pf_issued=0, pf_used=0, pf_wasted=0,
+        self.trace = None  # set to a list to record (layer, expert ids) of every decode step
+        self.stats = dict(hits=0, misses=0, bytes_read=0, read_s=0.0, sync_s=0.0, calls=0,
+                          fallback=0, stack_s=0.0, pf_issued=0, pf_used=0, pf_wasted=0,
                           pf_wait_s=0.0, pf_submit_s=0.0, predict_s=0.0)
 
-    def _admit(self, key, arrs, raws, oldest=False):
-        self.lru[key] = (arrs, raws)
-        if oldest:  # unclaimed speculation: first to go, never displaces a hot expert
-            self.lru.move_to_end(key, last=False)
-        while len(self.lru) > self.capacity:
-            self._grave.extend(self.lru.popitem(last=False)[1][1])
+    @property
+    def capacity(self):
+        return sum(self.slots)
 
-    def _reclaim(self):
-        """Called right after a GPU sync: nothing pending can still read evicted buffers."""
-        if self._grave:
-            self.store.recycle(self._grave)
-            self._grave = []
-        if self._dropped:
-            keep = []
-            for p in self._dropped:
-                if self.store.done(p):
-                    self.store.recycle(p.raws)
-                else:
-                    keep.append(p)
-            self._dropped = keep
+    @property
+    def resident(self):
+        return sum(len(o) for o in self.order)
 
-    def get(self, layer, experts, admit=True):
-        """Return {expert: arrays}. Cached and prefetched experts are free; the rest
-        are read in parallel from disk."""
-        self._reclaim()
-        got, missing, claimed = {}, [], []
-        for e in experts:
-            key = (layer, int(e))
-            if key in self.lru:
-                self.lru.move_to_end(key)
-                got[int(e)] = self.lru[key][0]
-            elif key in self.inflight:
-                claimed.append(int(e))
-            else:
-                missing.append(int(e))
-        self.stats["hits"] += len(got)
+    def _take_slot(self, l, protect):
+        """A free slot, else evict the oldest resident expert not in `protect`."""
+        if self.free[l]:
+            return self.free[l].pop()
+        for e in self.order[l]:
+            if e not in protect:
+                return self.order[l].pop(e)
+        return None
+
+    def _settle(self, l, protect):
+        """Finished prefetches nobody asked for become the oldest residents."""
+        pend = self.pending[l]
+        for e in [e for e in pend if e not in protect and all(f.done() for f in pend[e][1])]:
+            slot, futs = pend.pop(e)
+            for f in futs:
+                f.result()
+            self.order[l][e] = slot
+            self.order[l].move_to_end(e, last=False)
+            self.stats["pf_wasted"] += 1
+
+    def lookup(self, l, ids):
+        """Make every expert in `ids` (distinct ints) resident in layer l's slab and return
+        their slots, or None if the layer cannot hold them all at once."""
+        protect = set(ids)
+        self._settle(l, protect)
+        order, pend = self.order[l], self.pending[l]
+        hits = [e for e in ids if e in order]
+        claimed = [e for e in ids if e in pend]
+        missing = [e for e in ids if e not in order and e not in pend]
+        if len(missing) > len(self.free[l]) + sum(1 for e in order if e not in protect):
+            return None
+        for e in hits:
+            order.move_to_end(e)
+        s = self.stats
         if claimed:
             t = time.perf_counter()
             for e in claimed:
-                p = self.inflight.pop((layer, e))
-                arrs = self.store.finish(layer, p)
-                got[e] = arrs
-                if admit:
-                    self._admit((layer, e), arrs, p.raws)
-            self.stats["pf_wait_s"] += time.perf_counter() - t
-            self.stats["pf_used"] += len(claimed)
-            self.stats["hits"] += len(claimed)
-        self.stats["misses"] += len(missing)
+                slot, futs = pend.pop(e)
+                for f in futs:
+                    f.result()
+                order[e] = slot
+            s["pf_wait_s"] += time.perf_counter() - t
+            s["pf_used"] += len(claimed)
         if missing:
             t = time.perf_counter()
-            loaded = self.store.read_many(layer, missing)  # {e: (arrays, raws)}
-            self.stats["read_s"] += time.perf_counter() - t
-            self.stats["bytes_read"] += len(missing) * self.store.expert_bytes
-            got.update({e: arrs for e, (arrs, _) in loaded.items()})
-            if admit:
-                for e, (arrs, raws) in loaded.items():
-                    self._admit((layer, e), arrs, raws)
-        if self.inflight:
-            self._sweep(layer)
-        return got
+            new, futs = [], []
+            for e in missing:
+                slot = self._take_slot(l, protect)
+                new.append((e, slot))
+                futs.extend(self.store.fill_slot(l, e, self.views[l], slot, self.store.pool))
+            for f in futs:
+                f.result()
+            for e, slot in new:
+                order[e] = slot
+            s["read_s"] += time.perf_counter() - t
+            s["bytes_read"] += len(missing) * self.store.expert_bytes
+        s["hits"] += len(hits) + len(claimed)
+        s["misses"] += len(missing)
+        return [order[e] for e in ids]
 
-    def _sweep(self, layer):
-        """Speculative reads for this layer nobody claimed: resolve now so they never
-        pile up. Finished ones are kept only if there is spare room (and evicted first);
-        unfinished ones are dropped (their buffers live until the read ends)."""
-        for key in [k for k in self.inflight if k[0] == layer]:
-            p = self.inflight.pop(key)
-            self.stats["pf_wasted"] += 1
-            if len(self.lru) < self.capacity and self.store.done(p):
-                self._admit(key, self.store.finish(layer, p), p.raws, oldest=True)
+    def prefetch(self, l, ids):
+        """Start background reads into free/oldest slots for experts not yet resident."""
+        order, pend = self.order[l], self.pending[l]
+        ids = list(dict.fromkeys(int(x) for x in ids))
+        protect = set(ids)
+        issued = 0
+        for e in ids:
+            if e in order or e in pend:
+                continue
+            slot = self._take_slot(l, protect)
+            if slot is None:
+                break
+            pend[e] = (slot, self.store.fill_slot(l, e, self.views[l], slot,
+                                                  self.store.pf_pool, chunk=0))
+            issued += 1
+        self.stats["pf_issued"] += issued
+        self.stats["bytes_read"] += issued * self.store.expert_bytes
+
+    def fetch_group(self, l, group):
+        """Per-expert 9-tuples for a temporary stacked call (prefill, or more distinct
+        experts than slots): slab rows for residents, fresh reads for the rest. Nothing is
+        admitted, so a long prompt cannot flush the decode working set."""
+        order, out, missing = self.order[l], {}, []
+        for e in group:
+            e = int(e)
+            if e in order:
+                slot = order[e]
+                out[e] = tuple(self.arrays[l][i][slot] for i in range(len(PIECES)))
             else:
-                self._dropped.append(p)  # buffers return to the pool once the read ends
-
-    def prefetch(self, layer, experts):
-        """Start background reads for experts that are neither cached nor in flight."""
-        new = [e for e in dict.fromkeys(int(x) for x in experts)
-               if (layer, e) not in self.lru and (layer, e) not in self.inflight]
-        if not new:
-            return
-        for e, p in self.store.start_read(layer, new, pool=self.store.pf_pool, chunk=0).items():
-            self.inflight[(layer, e)] = p
-        self.stats["pf_issued"] += len(new)
-        self.stats["bytes_read"] += len(new) * self.store.expert_bytes
+                missing.append(e)
+        s = self.stats
+        s["hits"] += len(out)
+        s["misses"] += len(missing)
+        if missing:
+            t = time.perf_counter()
+            out.update(self.store.read_temp(l, missing))
+            s["read_s"] += time.perf_counter() - t
+            s["bytes_read"] += len(missing) * self.store.expert_bytes
+        return out
 
     def summary(self):
         s = self.stats
         total = s["hits"] + s["misses"]
-        out = (f"cache {len(self.lru)}/{self.capacity} experts, hit rate "
+        out = (f"slabs {self.resident}/{self.capacity} experts, hit rate "
                f"{s['hits'] / max(total, 1):.1%} ({s['hits']}/{total}), read "
                f"{s['bytes_read'] / GB:.1f} GB (demand wait {s['read_s']:.1f}s), "
-               f"stack {s['stack_s']:.1f}s, gpu-sync {s['sync_s']:.1f}s")
+               f"gpu-sync {s['sync_s']:.1f}s, fallback calls {s['fallback']}")
         if s["pf_issued"]:
             out += (f" | prefetch issued {s['pf_issued']}, used {s['pf_used']} "
                     f"({s['pf_used'] / s['pf_issued']:.0%}), unclaimed {s['pf_wasted']}, "
@@ -291,25 +308,25 @@ class StreamingSwitchGLU(nn.Module):
         self.layer_idx = layer_idx
         self.cache = cache
         self.group_max = group_max
-        self.admit_max_tokens = admit_max_tokens  # long prefills read-through, not admit
+        self.admit_max_tokens = admit_max_tokens  # more tokens than this = prefill path
         # Keep the template out of the module tree (no parameters, not quantized/saved).
+        # Its weights are this layer's slabs; prefill temporarily swaps in stacked experts.
         object.__setattr__(self, "_glu", template)
-        # Tiny stand-ins, put back after every call so the template never pins the
-        # last stacked expert weights (that was ~11 GB at decode, 30+ GB after prefill).
-        object.__setattr__(self, "_placeholders",
-                           [getattr(getattr(template, p), k) for p, k in PIECES])
+        object.__setattr__(self, "_slab", cache.arrays[layer_idx])
+        for (proj, kind), arr in zip(PIECES, self._slab):
+            setattr(getattr(template, proj), kind, arr)
         object.__setattr__(self, "next_layer", None)  # set by enable_prefetch
 
-    def _run(self, xs, local_inds, group, admit):
-        arrs = self.cache.get(self.layer_idx, group, admit)
+    def _run_stacked(self, xs, local_inds, group):
+        """Prefill path: stack the group's experts, run, put the slabs back."""
+        arrs = self.cache.fetch_group(self.layer_idx, group)
         t = time.perf_counter()
         stacked = [mx.stack([arrs[int(e)][i] for e in group]) for i in range(len(PIECES))]
         self.cache.stats["stack_s"] += time.perf_counter() - t
-        for pi, (proj, kind) in enumerate(PIECES):
-            setattr(getattr(self._glu, proj), kind, stacked[pi])
+        for (proj, kind), arr in zip(PIECES, stacked):
+            setattr(getattr(self._glu, proj), kind, arr)
         y = self._glu(xs, mx.array(local_inds.astype(np.uint32)))
-        # The lazy graph keeps `stacked` alive until evaluated; the module must not.
-        for (proj, kind), arr in zip(PIECES, self._placeholders):
+        for (proj, kind), arr in zip(PIECES, self._slab):
             setattr(getattr(self._glu, proj), kind, arr)
         return y
 
@@ -325,32 +342,44 @@ class StreamingSwitchGLU(nn.Module):
         return mx.argpartition(-sc, kth=k - 1, axis=-1)[..., :k]
 
     def __call__(self, x, indices):
+        cache, st = self.cache, self.cache.stats
         n_tok = int(np.prod(indices.shape[:-1]))
-        speculate = self.cache.prefetch_k > 0 and n_tok <= self.admit_max_tokens
+        speculate = cache.prefetch_k > 0 and n_tok <= self.admit_max_tokens
         t = time.perf_counter()
         pred = self._predict() if speculate else None
-        self.cache.stats["predict_s"] += time.perf_counter() - t
+        st["predict_s"] += time.perf_counter() - t
         t = time.perf_counter()
         # Also flushes the previous layers' pending GPU work.
         mx.eval(indices) if pred is None else mx.eval(indices, pred)
-        self.cache.stats["sync_s"] += time.perf_counter() - t
-        self.cache.stats["calls"] += 1
+        st["sync_s"] += time.perf_counter() - t
+        st["calls"] += 1
         idx = np.array(indices)
         lead, k = idx.shape[:-1], idx.shape[-1]
         xf = x.reshape(-1, x.shape[-1])
         idxf = idx.reshape(-1, k)
-        admit = n_tok <= self.admit_max_tokens
         uniq = np.unique(idxf)
-        groups = [uniq[i:i + self.group_max] for i in range(0, len(uniq), self.group_max)]
+        if cache.trace is not None and n_tok == 1:
+            cache.trace.append((self.layer_idx, uniq.copy()))
 
-        if len(groups) == 1:
-            y = self._run(xf, np.searchsorted(groups[0], idxf), groups[0], admit)
+        slots = None
+        if n_tok <= self.admit_max_tokens and len(uniq) <= cache.slots[self.layer_idx]:
+            slots = cache.lookup(self.layer_idx, uniq.tolist())
+        if slots is not None:  # decode: experts are read in place from the slab
+            lut = np.zeros(cache.store.num_experts, dtype=np.uint32)
+            lut[uniq] = slots
+            y = self._glu(xf, mx.array(lut[idxf]))
             if speculate:
                 if pred is not None:
                     t = time.perf_counter()
-                    self.cache.prefetch(self.layer_idx + 1, np.array(pred).reshape(-1))
-                    self.cache.stats["pf_submit_s"] += time.perf_counter() - t
+                    cache.prefetch(self.layer_idx + 1, np.array(pred).reshape(-1))
+                    st["pf_submit_s"] += time.perf_counter() - t
                 mx.async_eval(y)  # GPU starts the expert math now, overlapping the reads
+            return y.reshape(*lead, k, -1)
+
+        st["fallback"] += 1
+        groups = [uniq[i:i + self.group_max] for i in range(0, len(uniq), self.group_max)]
+        if len(groups) == 1:
+            y = self._run_stacked(xf, np.searchsorted(groups[0], idxf), groups[0])
             return y.reshape(*lead, k, -1)
 
         # Many distinct experts (prefill): handle one group of experts at a time and
@@ -359,7 +388,7 @@ class StreamingSwitchGLU(nn.Module):
         for g in groups:
             t_sel, j_sel = np.nonzero(np.isin(idxf, g))
             local = np.searchsorted(g, idxf[t_sel, j_sel])[:, None]
-            y = self._run(xf[mx.array(t_sel.astype(np.uint32))], local, g, admit)[:, 0]
+            y = self._run_stacked(xf[mx.array(t_sel.astype(np.uint32))], local, g)[:, 0]
             mx.eval(y)  # release this group's stacked weights before the next one
             pieces.append(y)
             orders.append(t_sel * k + j_sel)
@@ -383,7 +412,7 @@ def _hook_norm(norm, layer_idx, cache):
     norm.__class__ = Hooked
 
 
-def enable_prefetch(model, cache, k=12):
+def enable_prefetch(model, cache, k=4):
     """Predict layer l+1's experts during layer l and read them in the background."""
     cache.prefetch_k = k
     layers = model.layers
@@ -393,12 +422,20 @@ def enable_prefetch(model, cache, k=12):
         object.__setattr__(layer.mlp.switch_mlp, "next_layer", nxt)
 
 
-def build_streaming_model(model_dir, model_module, cache_gb=None, group_max=48,
-                          nocache=True, threads=24, reserve_gb=10.0, prefetch_k=0,
-                          prefetch_threads=16, verbose=True):
+def split_slots(total, num_layers, weights=None):
+    """Divide `total` expert slots over the layers (equal, or proportional to `weights`)."""
+    w = np.ones(num_layers) if weights is None else np.asarray(weights, dtype=float)
+    return np.maximum(1, np.floor(w / w.sum() * total)).astype(int).tolist()
+
+
+def build_streaming_model(model_dir, model_module, cache_gb=None, slots_per_layer=None,
+                          layer_weights=None, group_max=48, nocache=True, threads=24,
+                          reserve_gb=10.0, prefetch_k=0, prefetch_threads=16, verbose=True):
     """Build `model_module.Model` with dense weights resident and experts streamed.
 
-    cache_gb=None sizes the expert cache from the GPU's recommended working set.
+    The expert slabs get `slots_per_layer` slots per layer (an int or a list), or, by
+    default, `cache_gb` worth of slots split over the layers (`layer_weights` = relative
+    shares, default equal). cache_gb=None sizes it from the GPU's recommended working set.
     prefetch_k>0 turns on speculative next-layer reads (top-k predicted experts).
     """
     model_dir = Path(model_dir)
@@ -419,11 +456,16 @@ def build_streaming_model(model_dir, model_module, cache_gb=None, group_max=48,
                         nocache=nocache, threads=threads, prefetch_threads=prefetch_threads)
 
     resident = sum(v.nbytes for v in weights.values())
-    if cache_gb is None:
-        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
-        limit = info["max_recommended_working_set_size"] / GB
-        cache_gb = max(1.0, limit - resident / GB - reserve_gb)
-    cache = ExpertCache(store, cache_gb * GB)
+    if slots_per_layer is None:
+        if cache_gb is None:
+            info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+            limit = info["max_recommended_working_set_size"] / GB
+            cache_gb = max(1.0, limit - resident / GB - reserve_gb)
+        slots_per_layer = split_slots(int(cache_gb * GB // store.expert_bytes),
+                                      args.num_hidden_layers, layer_weights)
+    elif isinstance(slots_per_layer, int):
+        slots_per_layer = [slots_per_layer] * args.num_hidden_layers
+    cache = ExpertCache(store, slots_per_layer)
 
     for i, layer in enumerate(model.layers):
         old = layer.mlp.switch_mlp
@@ -450,8 +492,9 @@ def build_streaming_model(model_dir, model_module, cache_gb=None, group_max=48,
     if prefetch_k > 0:
         enable_prefetch(model, cache, prefetch_k)
     if verbose:
-        print(f"resident {resident / GB:.1f} GB, expert cache {cache_gb:.1f} GB "
-              f"({cache.capacity} of {args.num_hidden_layers * args.num_local_experts} experts, "
+        total = args.num_hidden_layers * args.num_local_experts
+        print(f"resident {resident / GB:.1f} GB, expert slabs {cache.capacity * store.expert_bytes / GB:.1f} GB "
+              f"({cache.capacity} of {total} experts, {min(cache.slots)}-{max(cache.slots)} per layer, "
               f"{store.expert_bytes / 2**20:.1f} MB each)"
               + (f", prefetch top-{prefetch_k}" if prefetch_k else ""), flush=True)
     return model, cache
