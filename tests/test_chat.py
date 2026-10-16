@@ -53,6 +53,121 @@ def last_logits_match(name, ref, sess, probe=7):
     return rel < 0.05
 
 
+class Flaky:
+    """The model, except that call number `fail_at` raises."""
+
+    def __init__(self, model):
+        self._m, self.calls, self.fail_at = model, 0, None
+
+    def __call__(self, *a, **kw):
+        self.calls += 1
+        if self.fail_at is not None and self.calls == self.fail_at:
+            raise RuntimeError("injected model failure")
+        return self._m(*a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._m, name)
+
+
+def report(name, cond, detail=""):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"  [{detail}]" if detail and not cond else ""))
+    return bool(cond)
+
+
+def robustness(model, tok, ref):
+    print("robustness")
+    ok = True
+    U = lambda t: {"role": "user", "content": t}       # noqa: E731
+    A = lambda t: {"role": "assistant", "content": t}  # noqa: E731
+
+    # an exception in the middle of a turn must not leave a cache that silently disagrees with the history
+    flaky = Flaky(model)
+    s = cs.ChatSession(flaky, tok, max_context=400, small_step=4, small_below=30)
+    s.send("hello", max_tokens=3)
+    before = (list(s.history), [dict(m) for m in s.messages])
+    flaky.fail_at = flaky.calls + 3
+    try:
+        s.send("this turn will fail", max_tokens=6)
+        failed = False
+    except RuntimeError:
+        failed = True
+    ok &= report("a model error propagates", failed)
+    ok &= report("the conversation is unchanged by the failed turn", s.messages == before[1] and s.history == before[0])
+    t = s.send("and now it works again", max_tokens=3)
+    ok &= report("the next turn rebuilds the cache from the messages", t.rebuilt and t.reused == 0, (t.rebuilt, t.reused))
+    ok &= report("... and is consistent with a fresh prefill", last_logits_match("after a failed turn", ref, s))
+    ok &= report("the failed message is not in the conversation, the retry is",
+                 [m["content"] for m in s.messages if m["role"] == "user"] == ["hello", "and now it works again"])
+
+    # a failure while rebuilding / on a dirty session
+    s2 = cs.ChatSession(flaky, tok, max_context=400, small_step=4, small_below=30)
+    s2.restore([U("a"), A("b"), U("c"), A("d")])
+    flaky.fail_at = flaky.calls + 1
+    try:
+        s2.send("e", max_tokens=2)
+    except RuntimeError:
+        pass
+    t = s2.send("e", max_tokens=2)
+    ok &= report("a failed rebuild is retried from scratch", t.rebuilt and len(s2.messages) == 6)
+    ok &= report("... and is consistent", last_logits_match("after a failed rebuild", ref, s2))
+
+    # the context limit
+    s3 = cs.ChatSession(model, tok, max_context=120, small_step=4, small_below=30)
+    s3.send("hi", max_tokens=3)
+    snap = (list(s3.history), [dict(m) for m in s3.messages], {c.offset for c in s3.cache})
+    try:
+        s3.send("y" * 100, max_tokens=3)
+        raised = False
+    except cs.ContextFull:
+        raised = True
+    ok &= report("ContextFull on a live session", raised)
+    ok &= report("... changes nothing", (list(s3.history), s3.messages, {c.offset for c in s3.cache}) == snap)
+    s3.send("ok", max_tokens=3)
+    ok &= report("... and the session carries on", last_logits_match("after ContextFull", ref, s3))
+    s3b = cs.ChatSession(model, tok, max_context=120, small_step=4, small_below=30)
+    s3b.restore([U("a"), A("b")])
+    try:
+        s3b.send("z" * 200, max_tokens=3)
+    except cs.ContextFull:
+        pass
+    t = s3b.send("fine", max_tokens=2)
+    ok &= report("ContextFull on a session that needed a rebuild still recovers", len(s3b.messages) == 4)
+    ok &= report("... consistently", last_logits_match("after ContextFull + rebuild", ref, s3b))
+    t = s3.send("w", max_tokens=1000)
+    ok &= report("max_tokens is clamped to the room left", s3.context <= 120 and t.finish in ("length", "stop"),
+                 (s3.context, t.finish))
+
+    # system prompt
+    s4 = cs.ChatSession(model, tok, max_context=400, small_step=4, small_below=30)
+    s4.restore([{"role": "system", "content": "be brief"}, U("a"), A("b")])
+    t = s4.send("c", max_tokens=2)
+    ok &= report("a conversation with a system message", t.rebuilt and s4.messages[0]["role"] == "system")
+    ok &= report("... is consistent", last_logits_match("with a system message", ref, s4))
+    s4.messages[0]["content"] = "be verbose"
+    t = s4.send("d", max_tokens=2)
+    ok &= report("changing the system message rebuilds", t.rebuilt and t.reused == 0, (t.rebuilt, t.reused))
+
+    # odd input
+    s5 = cs.ChatSession(model, tok, max_context=400, small_step=4, small_below=30)
+    for text in ["", "   ", "line\nbreak\ttab", "\u00e9\u4e2d\U0001f600 unknown to the tiny vocab", "<|eot|><|start|>"]:
+        try:
+            s5.send(text, max_tokens=2)
+            good = {c.offset for c in s5.cache} == {s5.context}
+        except Exception as e:  # noqa: BLE001
+            good = False
+            print("   ", repr(text), type(e).__name__, e)
+        ok &= report(f"message {text!r}", good)
+    # (no logits comparison here: on a random tiny MoE the near-tied routers make even the stock model differ by
+    # 10-35% between one-shot and token-by-token evaluation for some inputs; the structure is what we check)
+    ok &= report("... the cache and the history still agree", {c.offset for c in s5.cache} == {s5.context}
+                 and len(s5.messages) == 10)
+    s5.restore([])
+    ok &= report("restore([]) is an empty, clean session", s5.context == 0 and not s5.messages and not s5._dirty)
+    s5.restore([U("x"), A("y")], None)
+    ok &= report("restore keeps the effort when none is given", s5.effort == "medium" and s5._dirty)
+    return ok
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="chat_ckpt_"))
     ok = True
@@ -122,6 +237,8 @@ def main():
         t = s4.send("c", max_tokens=3)
         ok &= t.rebuilt and len(s4.messages) == 4 and s4.effort == "low"
         ok &= last_logits_match("after restore: cache == fresh prefill", ref, s4)
+
+        ok &= robustness(model, tok, ref)
 
         # context limit
         s3 = cs.ChatSession(model, tok, max_context=40)

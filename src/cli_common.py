@@ -32,9 +32,10 @@ def add_model_args(ap, root):
 def generation_defaults(model_dir):
     """The model's recommended sampling settings (generation_config.json)."""
     try:
-        return json.loads((Path(model_dir) / "generation_config.json").read_text())
-    except OSError:
+        cfg = json.loads((Path(model_dir) / "generation_config.json").read_text())
+    except (OSError, ValueError):
         return {}
+    return cfg if isinstance(cfg, dict) else {}
 
 
 def add_sampling_args(ap, model_dir, greedy_default):

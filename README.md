@@ -116,51 +116,97 @@ doubt (for example Ctrl-C in the middle of a step) it is rebuilt from the stored
 ## Server
 
 ```bash
-.venv/bin/python serve.py            # http://127.0.0.1:8000/v1
+.venv/bin/python serve.py            # this machine only: http://127.0.0.1:8000/v1
+.venv/bin/python serve.py --lan      # the local network; prints the URLs and an API key
 ```
 
-An OpenAI-compatible endpoint (`POST /v1/chat/completions`, blocking or `"stream": true`, and
-`GET /v1/models`), so existing clients work: point them at `http://127.0.0.1:8000/v1` with any API key.
-It was checked with the official `openai` Python client.
+An OpenAI-compatible endpoint (`POST /v1/chat/completions`, blocking or `"stream": true`,
+`GET /v1/models`, and `GET /health`), so existing clients work: point them at the printed URL. It was checked
+with the official `openai` Python client.
 
-- **One conversation is cached.** The API is stateless (the client resends the history) but the model is not:
-  when a request is the stored conversation plus one new user message, only the new tokens are processed
+- **Conversations are cached.** The API is stateless (the client resends the history) but the model is not:
+  when a request is a stored conversation plus one new user message, only the new tokens are processed
   (`usage.prompt_tokens_details.cached_tokens` shows the reuse; a 10-token follow-up reached its first
-  token in about 2-3 s). Any other conversation, a changed system prompt or a changed `reasoning_effort`
-  is rebuilt from scratch, which costs a full prefill (about 25 s for a short prompt, ~50-70 tok/s for long ones).
-  Alternating between two conversations therefore rebuilds every time.
+  token in about 2-3 s). `--sessions N` (default 2) keeps N conversations at once, so two people can take
+  turns without rebuilding each other's cache. Any other conversation, a changed system prompt or a changed
+  `reasoning_effort` is rebuilt from scratch in the least recently used slot, which costs a full prefill (about
+  25 s for a short prompt, ~50-70 tok/s for long ones). Each conversation costs up to ~64 KB of memory per
+  token of context (1 GB at the default `--max-context 16384`); the startup line prints the total.
 - **Reasoning.** `message.content` is the answer only; the model's reasoning comes in
   `message.reasoning_content` (and as `reasoning_content` deltas when streaming), which several clients show.
-  `--hide-reasoning` drops it. Reasoning counts toward `max_tokens` (default `--max-tokens 4096`): a small
-  `max_tokens` can be used up before the answer starts.
+  `--hide-reasoning` drops it. Reasoning counts toward `max_tokens` (default `--max-tokens 4096`, at most
+  `--max-tokens-cap` 8192): a small `max_tokens` can be used up before the answer starts.
 - **Supported:** `messages` (system/developer first, user, assistant; text only), `max_tokens` /
   `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `reasoning_effort` (`low`, `medium`, `high`,
-  `xhigh`), `stream`, `stream_options.include_usage`. Defaults for sampling come from the model's own
-  `generation_config.json`. A client that disconnects mid-reply stops the generation.
+  `xhigh`; a request without one gets the server's `--reasoning-effort`), `stream`,
+  `stream_options.include_usage`. Defaults for sampling come from the model's own `generation_config.json`.
 - **Not supported** (a clear 400): tools / function calling, images and audio, `n > 1`, `logprobs`,
   `response_format` other than text. `stop`, penalties and `seed` are ignored.
-- **Requests are served one at a time**, in order (one GPU, one cache).
-- **Access:** it listens on 127.0.0.1 only. `--host 0.0.0.0` exposes the model to your network: add
-  `--api-key KEY` if you do. CORS headers are off; `--cors-origin ORIGIN` allows one browser origin.
-  The model license asks that products built on it say "Built with Muse Spark Open".
+
+### On a local network
+
+`--lan` is `--host 0.0.0.0`: every device on the network can reach the server, so it never starts without a key.
+
+```
+$ .venv/bin/python serve.py --lan --api-key-file ~/.llm-server-key
+Serving ... (Built with Muse Spark Open) - reasoning effort medium, 2 conversation(s) of up to 16384 tokens ...
+  http://my-mac.local:8000/v1
+  http://192.168.1.20:8000/v1
+  http://127.0.0.1:8000/v1
+  new API key Xk3... saved to /Users/me/.llm-server-key
+```
+
+Clients use one of those URLs with the key as the API key (`Authorization: Bearer KEY`).
+
+- **The key.** `--api-key-file` creates a random key on the first run (owner-only permissions) and reuses it
+  after that. Without it, a network server generates a key for that run and prints it. `--api-key KEY` and the
+  `LLM_SERVER_API_KEY` environment variable also work (`--api-key` shows up in `ps`). `--no-auth` is the
+  explicit opt-out. `/health` needs no key; it shows `busy`, `queued`, the conversation sizes and memory use.
+- **It is plain HTTP.** The key and the conversations cross the network unencrypted, which is fine on a network
+  you trust and not on one you do not. `--tls-cert cert.pem --tls-key key.pem` serves HTTPS (a self-signed one:
+  `openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj /CN=my-mac.local`;
+  clients must trust it). Do not put this on the open Internet: it has no rate limiting per user and answers one
+  request at a time.
+- **Several clients share one model.** Requests are answered one at a time, in order. While one waits, a
+  streaming client receives SSE keep-alive comments and a blocking one simply waits (a client that gives up
+  while queued is dropped from the queue). When `--max-queue` (8) requests are already waiting or running, the
+  next gets `429` with `Retry-After`, which the OpenAI clients retry on their own.
+- **Limits** keep a stuck or hostile device from tying the server up: `--max-connections` (64, more get `503`),
+  `--client-timeout` (60 s of stalled reading or writing), a 16 MB request body, a conversation that cannot fit
+  `--max-context` is refused before it is tokenized, and `--max-tokens-cap` bounds a reply.
+- **Browsers.** CORS is off. `--cors-origin http://host:port` allows one web app (and answers Chrome's
+  private-network preflight). A server without a key that listens on this machine only also checks the `Host`
+  header, so a web page cannot reach it through DNS rebinding, and `POST` needs `Content-Type: application/json`
+  so a page cannot send one without a CORS preflight.
+- **macOS** asks "Do you want python to accept incoming network connections?" the first time; allow it.
+  IPv6 works (`--host ::`).
+- Every request is logged on stderr with the client address, status and timings (never the key).
+- Checked on the real model from the machine's LAN address with a key: two conversations took turns and each
+  follow-up reused its own cache (429 and 663 tokens cached; first token 2.8 s and 1.8 s); a third conversation
+  evicted the least recently used one; a second client queued behind a running request (`/health` showed
+  `queued: 1`) and was served after it; peak memory 98.9 GB; Ctrl-C stopped the server in about a second.
 
 ## Tests
 
 ```bash
-.venv/bin/python -I tests/test_tiny.py
-.venv/bin/python -I tests/test_turns.py
-.venv/bin/python -I tests/test_chat.py
-.venv/bin/python -I tests/test_server.py
+tests/run_all.sh                       # everything below; none of it needs the real model
+.venv/bin/python -I tests/test_lan.py  # or one at a time: tiny, turns, chat, server, lan, store, cli
 ```
 
-Builds a tiny 3-bit checkpoint (2 shards, the real tensor names) and checks that the
+`test_tiny.py` builds a tiny 3-bit checkpoint (2 shards, the real tensor names) and checks that the
 streaming model matches the stock in-memory model for prefill and greedy decoding, across
 slab sizes (larger than, equal to, and smaller than a token's expert count), eviction, and
-prefetch. `test_turns.py` checks the reasoning/answer splitter. `test_chat.py` runs multi-turn sessions on a
+prefetch. `test_store.py` checks safetensors header validation, the expert cache's slot accounting, and
+that a failed or short read neither leaks a slot nor leaves garbage mapped as a hit. `test_turns.py` checks the
+reasoning/answer splitter (including random chunk boundaries). `test_chat.py` runs multi-turn sessions on a
 tiny float32 checkpoint and checks that the incremental KV cache gives the same logits as a fresh
-prefill of the same tokens (including a wrapped sliding window, a cut-short turn and a cache rebuild).
-`test_server.py` runs the HTTP layer against a scripted session (matching, streaming format, errors,
-API key, client disconnect) and end to end on the tiny checkpoint. None of them needs the real model.
+prefill of the same tokens (including a wrapped sliding window, a cut-short turn, a cache rebuild, a
+model error in the middle of a turn, and the context limit). `test_server.py` runs the HTTP layer against a
+scripted session (matching, streaming format, errors, API key, client disconnect) and end to end on the
+tiny checkpoint. `test_lan.py` covers the network side: several conversations, the queue and 429, clients that
+leave while queued, malformed and hostile requests, the connection limit, timeouts, the Host and Content-Type
+checks, CORS, key handling, request logs, IPv6 and TLS. `test_cli.py` covers the argument defaults and
+the printer.
 
 ## Layout
 
@@ -179,6 +225,10 @@ API key, client disconnect) and end to end on the tiny checkpoint. None of them 
 | `tests/test_turns.py` | unit test for the reasoning/answer splitter |
 | `tests/test_chat.py` | multi-turn KV-cache correctness on a tiny checkpoint |
 | `tests/test_server.py` | server tests (scripted session + tiny checkpoint) |
+| `tests/test_lan.py` | network tests: pool, queue, limits, hostile requests, access control, CORS, IPv6, TLS |
+| `tests/test_store.py` | safetensors header checks and expert cache accounting, including failed reads |
+| `tests/test_cli.py` | argument defaults and printer |
+| `tests/run_all.sh` | runs every test |
 | `meta/layer_weights.json` | per-layer slab sizing, measured from sampled decode traces |
 | `CLAUDE.md` | development log / project notes |
 
@@ -197,7 +247,8 @@ changed. If the checkpoint is reconverted for the merged layout, the vendored fi
   checkpoint.
 - Peak memory is kept below the GPU working-set limit by `--reserve-gb`. Conversations were tested up
   to about 11,000 tokens (peak 100.2 of 107.5 GB); longer ones grow the KV cache by ~64 KB per token, so
-  reduce `--cache-gb` or raise `--reserve-gb` if you raise `--max-context` a lot.
+  reduce `--cache-gb` or raise `--reserve-gb` if you raise `--max-context` a lot. The server keeps
+  `--sessions` conversations, and their caches add up (two short ones peaked at 98.9 GB, the same as one).
 - Greedy and sampled output was checked for coherence on a handful of prompts, not
   evaluated for quality.
 

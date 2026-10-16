@@ -124,6 +124,9 @@ class ChatSession:
                 finish = last.finish_reason if last and last.finish_reason else "stop"
         except KeyboardInterrupt:
             finish = "interrupted"
+        except BaseException:
+            self._dirty = True                # the cache may be ahead of `history` (a failed step, a broken pipe)
+            raise
         answer = "".join(parts["answer"])
 
         expected = self.history + ids + gen   # every yielded token has been fed to the model

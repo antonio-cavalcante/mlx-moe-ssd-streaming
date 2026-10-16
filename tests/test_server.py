@@ -37,11 +37,15 @@ def check(name, cond, detail=""):
 
 
 class FakeSession:
-    """Stands in for ChatSession: scripted reply, records how the server drove it."""
+    """Stands in for ChatSession: scripted reply, records how the server drove it.
 
-    def __init__(self):
-        self.messages, self.effort, self.sampler = [], "medium", None
+    gate: an Event; while it is not set, send() blocks (polling cancel) - a job that takes as long as the test wants.
+    echo: the answer is "echo:<user text>". fail: send() raises RuntimeError."""
+
+    def __init__(self, effort="medium"):
+        self.messages, self.effort, self.sampler = [], effort, None
         self.restores, self.sends, self.cancel_seen, self.slow, self.raise_ctx = [], [], False, False, False
+        self.gate, self.echo, self.fail, self.started = None, False, False, threading.Event()
         self._dirty = False
 
     def restore(self, messages, effort=None):
@@ -50,11 +54,23 @@ class FakeSession:
 
     def send(self, text, on_chunks=None, max_tokens=0, cancel=None):
         self.sends.append((text, max_tokens))
+        self.started.set()
+        if self.fail:
+            raise RuntimeError("boom")
         if self.raise_ctx:
             raise cs.ContextFull("too long")
         reused = sum(len(m["content"]) for m in self.messages)
         interrupted = False
-        if self.slow:
+        answer = f"echo:{text}" if self.echo else " Hello world! "
+        if self.gate is not None:
+            while not self.gate.wait(0.01):
+                if cancel():
+                    self.cancel_seen = interrupted = True
+                    break
+            self.started.clear()
+        if interrupted:
+            pass
+        elif self.slow:
             for _ in range(300):
                 on_chunks([("answer", "x ")])
                 time.sleep(0.01)
@@ -62,10 +78,11 @@ class FakeSession:
                     self.cancel_seen = interrupted = True
                     break
         else:
-            for ch in [("reasoning", "  let me"), ("reasoning", " think "), ("answer", " Hello"), ("answer", " world! ")]:
+            chunks = [("reasoning", "  let me"), ("reasoning", " think "), ("answer", " " + answer[:3]), ("answer", answer[3:])]
+            for ch in chunks:
                 on_chunks([ch])
-        self.messages += [{"role": "user", "content": text}, {"role": "assistant", "content": " Hello world! "}]
-        return cs.Turn(" Hello world! ", "  let me think ", 5, 9, 0.1, 4.0,
+        self.messages += [{"role": "user", "content": text}, {"role": "assistant", "content": answer}]
+        return cs.Turn(answer, "  let me think ", 5, 9, 0.1, 4.0,
                        "interrupted" if interrupted else "stop", 100, False, reused)
 
 
@@ -104,7 +121,8 @@ A = lambda t: {"role": "assistant", "content": t}  # noqa: E731
 def scripted_tests(port, fake):
     c = Client(port)
     print("endpoints")
-    check("health", c.call("GET", "/health") == (200, '{"status": "ok"}'))
+    st, txt = c.call("GET", "/health")
+    check("health", st == 200 and json.loads(txt) == {"status": "ok", "busy": False, "queued": 0, "sessions": 1}, txt)
     st, txt = c.call("GET", "/v1/models")
     check("models", st == 200 and json.loads(txt)["data"][0]["id"] == "test-model")
     check("unknown path -> 404", c.call("GET", "/nope")[0] == 404)
@@ -172,7 +190,7 @@ def scripted_tests(port, fake):
     fake.slow, fake.cancel_seen = True, False
     payload = json.dumps({"messages": [U("slow")], "stream": True}).encode()
     s = socket.create_connection(("127.0.0.1", port), timeout=30)
-    s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+    s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
               b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload)
     s.recv(200)                      # the first bytes of the stream arrived
     s.shutdown(socket.SHUT_RDWR)     # hang up mid-stream

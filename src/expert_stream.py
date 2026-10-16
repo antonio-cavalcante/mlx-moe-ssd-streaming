@@ -32,7 +32,7 @@ import struct
 import sys
 import time
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import mlx.core as mx
@@ -55,20 +55,42 @@ def read_safetensors_header(path):
     """{name: (abs_offset, nbytes, dtype, shape)} without reading any tensor data."""
     size = os.path.getsize(path)
     with open(path, "rb") as f:
-        (n,) = struct.unpack("<Q", f.read(8))
-        if n > 100 << 20:
-            raise ValueError(f"{path}: implausible safetensors header size {n}")
-        header = json.loads(f.read(n))
+        head = f.read(8)
+        if len(head) < 8:
+            raise ValueError(f"{path}: not a safetensors file (only {len(head)} bytes)")
+        (n,) = struct.unpack("<Q", head)
+        if n > 100 << 20 or 8 + n > size:
+            raise ValueError(f"{path}: implausible safetensors header size {n} (file is {size} bytes)")
+        try:
+            header = json.loads(f.read(n))
+        except ValueError as e:
+            raise ValueError(f"{path}: unreadable safetensors header: {e}") from None
+    if not isinstance(header, dict):
+        raise ValueError(f"{path}: safetensors header is not an object")
     base = 8 + n
     out = {}
     for name, v in header.items():
         if name == "__metadata__":
             continue
-        s, e = v["data_offsets"]
+        try:
+            s, e = v["data_offsets"]
+            dtype, shape = v["dtype"], tuple(v["shape"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(f"{path}: malformed entry for tensor {name}") from None
+        if not (isinstance(s, int) and isinstance(e, int) and 0 <= s <= e):
+            raise ValueError(f"{path}: bad data_offsets for tensor {name}: {s}, {e}")
         if base + e > size:
-            raise ValueError(f"{path}: tensor {name} extends past end of file")
-        out[name] = (base + s, e - s, v["dtype"], tuple(v["shape"]))
+            raise ValueError(f"{path}: tensor {name} extends past end of file (truncated download?)")
+        out[name] = (base + s, e - s, dtype, shape)
     return out
+
+
+def _join(futures):
+    """Wait for ALL futures (a failed read must not leave sibling reads still writing into the buffer), then
+    raise the first error."""
+    wait(futures)
+    for f in futures:
+        f.result()
 
 
 class ExpertStore:
@@ -139,8 +161,7 @@ class ExpertStore:
             step = self.chunk or stride
             futs.extend(self.pool.submit(self._fill, fd, base + e * stride + o, view[o:o + step])
                         for o in range(0, stride, step))
-        for f in futs:
-            f.result()
+        _join(futs)
         out = {}
         for (e, i), raw in raws.items():
             _, _, _, dtype, tail = self.loc[(layer,) + PIECES[i]]
@@ -200,8 +221,11 @@ class ExpertCache:
         pend = self.pending[l]
         for e in [e for e in pend if e not in protect and all(f.done() for f in pend[e][1])]:
             slot, futs = pend.pop(e)
-            for f in futs:
-                f.result()
+            try:
+                _join(futs)
+            except Exception:             # a speculative read failed: nobody needed it, just give the slot back
+                self.free[l].append(slot)
+                continue
             self.order[l][e] = slot
             self.order[l].move_to_end(e, last=False)
             self.stats["pf_wasted"] += 1
@@ -224,20 +248,27 @@ class ExpertCache:
             t = time.perf_counter()
             for e in claimed:
                 slot, futs = pend.pop(e)
-                for f in futs:
-                    f.result()
+                try:
+                    _join(futs)
+                except BaseException:     # the slot holds garbage: unmapped and free, never a hit
+                    self.free[l].append(slot)
+                    raise
                 order[e] = slot
             s["pf_wait_s"] += time.perf_counter() - t
             s["pf_used"] += len(claimed)
         if missing:
             t = time.perf_counter()
             new, futs = [], []
-            for e in missing:
-                slot = self._take_slot(l, protect)
-                new.append((e, slot))
-                futs.extend(self.store.fill_slot(l, e, self.views[l], slot, self.store.pool))
-            for f in futs:
-                f.result()
+            try:
+                for e in missing:
+                    slot = self._take_slot(l, protect)
+                    new.append((e, slot))
+                    futs.extend(self.store.fill_slot(l, e, self.views[l], slot, self.store.pool))
+                _join(futs)
+            except BaseException:         # e.g. an I/O error: the slots hold garbage, so they are free, not mapped
+                wait(futs)
+                self.free[l].extend(slot for _, slot in new)
+                raise
             for e, slot in new:
                 order[e] = slot
             s["read_s"] += time.perf_counter() - t
