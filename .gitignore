@@ -1,0 +1,7 @@
+# environment and large artifacts
+.venv/
+models/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
