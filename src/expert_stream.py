@@ -240,7 +240,10 @@ class ExpertCache:
         self.trace = None  # set to a list to record (layer, expert ids) of every decode step
         self.stats = dict(hits=0, misses=0, bytes_read=0, read_s=0.0, sync_s=0.0, calls=0,
                           fallback=0, stack_s=0.0, pf_issued=0, pf_used=0, pf_wasted=0,
-                          pf_wait_s=0.0, pf_submit_s=0.0, predict_s=0.0)
+                          pf_wait_s=0.0, pf_submit_s=0.0, predict_s=0.0,
+                          pf_evict=0, pf_regret=0, pf_reread=0)
+        self.victims = [dict() for _ in range(L)]  # expert -> tick: evicted to make room for a prefetch
+        self.tick = 0
 
     @property
     def capacity(self):
@@ -250,12 +253,17 @@ class ExpertCache:
     def resident(self):
         return sum(len(o) for o in self.order)
 
-    def _take_slot(self, l, protect):
+    REGRET_TICKS = 2 * 62  # an expert evicted for a prefetch and wanted again within ~2 tokens
+
+    def _take_slot(self, l, protect, for_prefetch=False):
         """A free slot, else evict the oldest resident expert not in `protect`."""
         if self.free[l]:
             return self.free[l].pop()
         for e in self.order[l]:
             if e not in protect:
+                if for_prefetch:
+                    self.victims[l][e] = self.tick
+                    self.stats["pf_evict"] += 1
                 return self.order[l].pop(e)
         return None
 
@@ -277,6 +285,7 @@ class ExpertCache:
         """Make every expert in `ids` (distinct ints) resident in layer l's slab and return
         their slots, or None if the layer cannot hold them all at once."""
         protect = set(ids)
+        self.tick += 1
         self._settle(l, protect)
         order, pend = self.order[l], self.pending[l]
         hits = [e for e in ids if e in order]
@@ -287,6 +296,10 @@ class ExpertCache:
         for e in hits:
             order.move_to_end(e)
         s = self.stats
+        vic = self.victims[l]
+        for e in missing:                 # a demand miss on an expert a prefetch had pushed out
+            if self.tick - vic.pop(e, -10**9) <= self.REGRET_TICKS:
+                s["pf_regret"] += 1
         if claimed:
             t = time.perf_counter()
             for e in claimed:
@@ -329,9 +342,11 @@ class ExpertCache:
         for e in ids:
             if e in order or e in pend:
                 continue
-            slot = self._take_slot(l, protect)
+            slot = self._take_slot(l, protect, for_prefetch=True)
             if slot is None:
                 break
+            if self.tick - self.victims[l].pop(e, -10**9) <= self.REGRET_TICKS:
+                self.stats["pf_reread"] += 1   # read again what an earlier prefetch evicted
             pend[e] = (slot, self.store.fill_slot(l, e, self.views[l], slot,
                                                   self.store.pf_pool, chunk=0))
             issued += 1

@@ -131,6 +131,13 @@ Everything in this repo uses GB = 2^30 bytes (`es.GB = 1 << 30`) and the GPU lim
   new (oQ3e) decode 4.25 / 4.26 / 4.37 tok/s, prefill 39 / 55 / 61 tok/s, peak 103.5 GiB; old (3-bit, commit 026d4d8 + meter patch) 4.68 / 4.47 / 4.68, 40 / 58 / 62, peak 99.7-100.6.
   So the old checkpoint is ~6-10% faster at decode (more slots: 4280 vs 3901; fewer misses 10.3-10.9% vs 11.1-11.4%), prefill equal within ~5%.
   New peak is ~3-4 GiB higher than the old one and constant from 2k to 12k tokens: it is the prefill stack/temporaries, not the KV cache.
+- Does prefetch hurt the cache? (`bench.py --prefetch-k 0` vs `4`, same 1161-token prompt, 300 greedy tokens, run twice each; identical lookups since prefetch does not change the math):
+  k=0: 82.6% in RAM, 17.4% demand miss, 1.77 GB/token, SSD busy 55%, demand wait 58%, decode 3.68 / 3.88 tok/s.
+  k=4: 82.5% in RAM, 5.4% prefetched, 12.1% demand miss, 2.05 GB/token, SSD busy 71%, demand wait 48%, decode 4.11 / 4.15 tok/s.
+  So the lookups that need the SSD are the same (17.4 vs 17.5%): the real cache hit rate is ~82.5%, not the 88% printed. Prefetch never re-reads a cached expert
+  (`prefetch()` skips resident/pending ones). Its costs: ~33% of prefetches unused (+0.28 GB/token = +16% traffic) and eviction damage: 36 evictions/token to make room,
+  of which only 1.2/token (372 per 299 tokens, 0.25% of lookups) were demand-missed within 2 tokens (`pf_regret`), 1.5/token re-read after being evicted by an earlier prefetch (`pf_reread`).
+  Net: +16% SSD bytes for +8% decode speed (hides latency; the SSD has spare bandwidth at k=0: 55% busy). Possible gains: predict better to cut the unused third; avoid evicting unprotected experts.
 - Test pitfall: `tests/test_store.py` replaces `store._fill` with a fault injector; it must accept `*args, **kw` (`_fill` now takes `kind`).
 
 ## Notes

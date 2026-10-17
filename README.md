@@ -34,6 +34,8 @@ changes decoding, since only 16 of the layers keep a full-length KV cache.
 miss moves 21 MB at ~10 GB/s; a hit moves the same 21 MB at memory speed, 50x faster. So the ~11% of lookups
 that miss (plus the ~40 speculative reads per token, a third of which go unused) cost about 1.9 GB per token of SSD traffic, ~0.2 s
 of a ~0.23 s token. The SSD is the bottleneck, which is why more cache slots help more than anything else.
+Prefetch (`--prefetch-k`, default 4) does not re-read cached experts; with it off, 17.4% of lookups miss (82.6% real cache hit rate),
+with it on 17.5% need the SSD, but 5% of them arrive early: +16% SSD bytes (a third of the prefetches go unused) for ~8% faster decoding.
 `bench.py` measures this (our own `preadv` counters, cross-checked against `iostat`, which agrees within ~10%).
 
 These are single-machine, short-run numbers, not a benchmark suite. Speed depends on your

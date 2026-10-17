@@ -114,7 +114,9 @@ def main():
              reported_hit_rate=round(d["hits"] / max(lookups, 1), 4),
              ssd_gb_per_token=round(disk_gb / max(n_dec, 1), 3),
              demand_gb=round(dio["demand_bytes"] / GB, 1), prefetch_gb=round(dio["prefetch_bytes"] / GB, 1),
-             prefetch_issued=d["pf_issued"], prefetch_used=d["pf_used"],
+             prefetch_issued=d["pf_issued"], prefetch_used=d["pf_used"], prefetch_evictions=d["pf_evict"],
+             prefetch_regret=d["pf_regret"], prefetch_reread=d["pf_reread"],
+             disk_lookups=round((d["misses"] + d["pf_used"]) / max(lookups, 1), 4),
              busy_frac=round(dio["busy_s"] / wall, 3), gb_s_while_busy=round(disk_gb / max(dio["busy_s"], 1e-9), 2),
              gb_s_average=round(disk_gb / wall, 2), reads_in_flight_avg=round(dio["thread_s"] / max(dio["busy_s"], 1e-9), 1),
              demand_wait_frac=round(d["read_s"] / wall, 3), pf_wait_frac=round(d["pf_wait_s"] / wall, 3),
@@ -140,6 +142,10 @@ def main():
           f"used {r['prefetch_used']}/{r['prefetch_issued']}), busy {r['busy_frac']:.0%} of decode wall time, "
           f"{r['gb_s_while_busy']} GB/s while busy, {r['gb_s_average']} GB/s on average, {r['reads_in_flight_avg']} reads in flight",
           file=sys.stderr)
+    if r["prefetch_issued"]:
+        print(f"prefetch side effects: {r['prefetch_evictions']} evictions to make room, of which {r['prefetch_regret']} "
+              f"were demand-missed within 2 tokens; {r['prefetch_reread']} prefetches re-read an expert an earlier prefetch evicted; "
+              f"lookups that needed the disk (miss or prefetched): {r['disk_lookups']:.1%}", file=sys.stderr)
     print(f"decode wall time: waiting for demand reads {r['demand_wait_frac']:.0%}, waiting for prefetch "
           f"{r['pf_wait_frac']:.0%}, gpu sync {r['gpu_sync_frac']:.0%}", file=sys.stderr)
     if "timeline_0.25s_gb_s" in r:
