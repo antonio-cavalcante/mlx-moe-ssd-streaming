@@ -8,11 +8,13 @@ from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import load as load_tokenizer
 
 import expert_stream as es
-import muse_spark_1975 as ms
+
+
+DEFAULT_MODEL = "models/Muse-Spark-Open-816B-A42B-oQ3e"
 
 
 def add_model_args(ap, root):
-    ap.add_argument("--model", default=str(root / "models/Muse-Spark-Open-816B-A42B-3bit"))
+    ap.add_argument("--model", default=str(root / DEFAULT_MODEL))
     ap.add_argument("--cache-gb", type=float, default=None,
                     help="expert slab size; default = GPU recommended working set minus resident minus reserve")
     ap.add_argument("--reserve-gb", type=float, default=10.0, help="headroom for KV cache/activations")
@@ -57,7 +59,7 @@ def load_all(args, root):
         layer_weights = json.loads(Path(args.layer_weights).read_text())["weights"]
     mx.set_cache_limit(4 << 30)  # keep MLX's free-buffer pool small; the expert slabs are our cache
     model, cache = es.build_streaming_model(
-        args.model, ms, cache_gb=args.cache_gb, group_max=args.group_max,
+        args.model, cache_gb=args.cache_gb, group_max=args.group_max,
         nocache=not args.page_cache, threads=args.threads, reserve_gb=args.reserve_gb,
         prefetch_k=args.prefetch_k, prefetch_threads=args.pf_threads, layer_weights=layer_weights)
     # The tokenizer alone only knows <|end_of_text|>; the model ends a turn with <|eot|>. Both are in config.json.

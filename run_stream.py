@@ -1,4 +1,4 @@
-"""Generate with Muse-Spark-Open-816B-A42B-3bit, streaming experts from SSD.
+"""Generate with Muse Spark Open 816B-A42B, streaming experts from SSD.
 
   .venv/bin/python run_stream.py --prompt "Explain mixture of experts in 3 sentences." --max-tokens 64
 """
@@ -16,7 +16,7 @@ from turns import TurnParser  # noqa: E402
 
 ap = argparse.ArgumentParser()
 cc.add_model_args(ap, ROOT)
-cc.add_sampling_args(ap, ROOT / "models/Muse-Spark-Open-816B-A42B-3bit", greedy_default=True)
+cc.add_sampling_args(ap, ROOT / cc.DEFAULT_MODEL, greedy_default=True)
 ap.add_argument("--prompt", default="Explain mixture-of-experts models in three sentences.")
 ap.add_argument("--max-tokens", type=int, default=64)
 ap.add_argument("--raw", action="store_true", help="skip the chat template")

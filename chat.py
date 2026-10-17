@@ -1,4 +1,4 @@
-"""Chat with Muse-Spark-Open-816B-A42B-3bit, streaming experts from SSD.
+"""Chat with Muse Spark Open 816B-A42B, streaming experts from SSD.
 
   .venv/bin/python chat.py [--reasoning-effort low|medium|high|xhigh] [--max-context 16384]
 
@@ -27,7 +27,7 @@ Ctrl-C while the model is answering stops the answer; the conversation continues
 
 ap = argparse.ArgumentParser()
 cc.add_model_args(ap, ROOT)
-cc.add_sampling_args(ap, ROOT / "models/Muse-Spark-Open-816B-A42B-3bit", greedy_default=False)
+cc.add_sampling_args(ap, ROOT / cc.DEFAULT_MODEL, greedy_default=False)
 ap.add_argument("--max-tokens", type=int, default=2048, help="most tokens per reply, reasoning included")
 ap.add_argument("--max-context", type=int, default=16384,
                 help="most tokens in the conversation (the KV cache costs ~64 KB per token)")

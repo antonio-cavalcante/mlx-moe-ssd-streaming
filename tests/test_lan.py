@@ -28,7 +28,6 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
 import chat_session as cs  # noqa: E402
 import expert_stream as es  # noqa: E402
-import muse_spark_1975 as ms  # noqa: E402
 import openai_server as srv  # noqa: E402
 import serve  # noqa: E402
 import test_chat as tc  # noqa: E402
@@ -698,8 +697,8 @@ def e2e_pool_test():
     print("two conversations on the tiny checkpoint (real ChatSession x2)")
     tmp = Path(tempfile.mkdtemp(prefix="lan_ckpt_"))
     try:
-        ref = tt.make_checkpoint(tmp, mx.float32)
-        model, _ = es.build_streaming_model(tmp, ms, slots_per_layer=6, prefetch_k=4, verbose=False)
+        ref = tt.make_checkpoint(tmp, mx.float32, fixed_routing=True)
+        model, _ = es.build_streaming_model(tmp, slots_per_layer=6, prefetch_k=4, verbose=False)
         tok = tc.make_tokenizer()
         sessions = [cs.ChatSession(model, tok, max_context=500, small_step=4, small_below=30) for _ in range(2)]
         engine = srv.Engine(sessions, lambda t, p, k: make_sampler(temp=t, top_p=p, top_k=k), log=lambda s: None)

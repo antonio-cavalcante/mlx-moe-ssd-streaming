@@ -1,4 +1,4 @@
-"""OpenAI-compatible server for Muse-Spark-Open-816B-A42B-3bit, streaming experts from SSD.
+"""OpenAI-compatible server for Muse Spark Open 816B-A42B, streaming experts from SSD.
 
   .venv/bin/python serve.py                       # this machine only: http://127.0.0.1:8000/v1
   .venv/bin/python serve.py --lan                 # the local network (an API key is generated for you)
@@ -28,7 +28,7 @@ KV_BYTES_PER_TOKEN = 64 << 10      # measured: 16 full-attention layers x K and 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     cc.add_model_args(ap, ROOT)
-    cc.add_sampling_args(ap, ROOT / "models/Muse-Spark-Open-816B-A42B-3bit", greedy_default=False)
+    cc.add_sampling_args(ap, ROOT / cc.DEFAULT_MODEL, greedy_default=False)
     net = ap.add_argument_group("network")
     net.add_argument("--host", default="127.0.0.1",
                      help="listen address; 127.0.0.1 = this machine only, 0.0.0.0 = every interface")

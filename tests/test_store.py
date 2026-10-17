@@ -17,7 +17,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
 import expert_stream as es  # noqa: E402
-import muse_spark_1975 as ms  # noqa: E402
 import test_tiny as tt  # noqa: E402
 
 FAILS = []
@@ -89,7 +88,7 @@ def intact(cache, l):
 
 def cache_tests(tmp):
     print("ExpertCache: LRU, accounting")
-    model, cache = es.build_streaming_model(tmp, ms, slots_per_layer=4, prefetch_k=0, verbose=False)
+    model, cache = es.build_streaming_model(tmp, slots_per_layer=4, prefetch_k=0, verbose=False)
     l = 1
     got = cache.lookup(l, [0, 1, 2, 3])
     check("4 misses fill the layer", got is not None and sorted(got) == [0, 1, 2, 3] and cache.stats["misses"] == 4)

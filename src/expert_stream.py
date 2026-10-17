@@ -1,7 +1,7 @@
 """Stream routed MoE experts from SSD instead of holding them in RAM.
 
-Only the dense weights (attention, embeddings, routers, pre/post expert projections,
-norms) are loaded into memory. For every MoE layer the router runs first, then just the
+The model is mlx-lm's own `muse_spark` (nothing is vendored). Only the dense weights
+(attention, embeddings, routers, pre/post expert projections, norms) are loaded into memory. For every MoE layer the router runs first, then just the
 selected experts are read from the original safetensors shards (by byte offset) and the
 usual gate/up/down SwiGLU runs on them.
 
@@ -40,12 +40,13 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten
 from mlx_lm.models.switch_layers import SwitchGLU
+from mlx_lm.utils import load_model
 
 PROJS = ("gate_proj", "up_proj", "down_proj")
 KINDS = ("weight", "scales", "biases")
 PIECES = tuple((p, k) for p in PROJS for k in KINDS)  # 9 tensors per expert
 _EXPERT_RE = re.compile(
-    r"^model\.layers\.(\d+)\.mlp\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$"
+    r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$"
 )
 _MX_DTYPE = {"U32": mx.uint32, "BF16": mx.bfloat16, "F16": mx.float16, "F32": mx.float32}
 GB = 1 << 30
@@ -335,8 +336,10 @@ class ExpertCache:
 class StreamingSwitchGLU(nn.Module):
     """Drop-in for SwitchGLU(x, indices) that pulls the needed experts from disk."""
 
-    def __init__(self, layer_idx, cache, template, group_max=48, admit_max_tokens=8):
+    def __init__(self, layer_idx, cache, template, post_expert_norm=None, group_max=48, admit_max_tokens=8):
         super().__init__()
+        if post_expert_norm is not None:     # mlx-lm's MoE reads this norm off its `experts` module
+            self.post_expert_norm = post_expert_norm
         self.layer_idx = layer_idx
         self.cache = cache
         self.group_max = group_max
@@ -348,6 +351,7 @@ class StreamingSwitchGLU(nn.Module):
         for (proj, kind), arr in zip(PIECES, self._slab):
             setattr(getattr(template, proj), kind, arr)
         object.__setattr__(self, "next_layer", None)  # set by enable_prefetch
+        object.__setattr__(self, "ratio", None)
 
     def _run_stacked(self, xs, local_inds, group):
         """Prefill path: stack the group's experts, run, put the slabs back."""
@@ -363,13 +367,17 @@ class StreamingSwitchGLU(nn.Module):
         return y
 
     def _predict(self):
-        """Lazy top-k expert ids for the NEXT layer from this layer's residual stream."""
+        """Lazy top-k expert ids for the NEXT layer, from this layer's residual stream.
+
+        `r` is what this layer's router saw: the residual stream normalized by this layer's
+        pre-feedforward norm. The next layer's router expects the same stream normalized by ITS
+        norm, which differs only by the per-channel gain ratio `self.ratio`."""
         nxt, r = self.next_layer, self.cache.resid.get(self.layer_idx)
         if nxt is None or r is None:
             return None
-        g = nxt.mlp.gate
-        sc = nxt.pre_feedforward_layernorm.plain(r).astype(mx.float32) @ g.weight.T
-        sc = mx.sigmoid(sc * g.output_multiplier) + g.e_score_correction_bias
+        moe = nxt.mlp
+        sc = (r.astype(mx.float32) * self.ratio) @ moe.gate.weight.T
+        sc = mx.sigmoid(sc * moe.router_multiplier) + moe.gate.e_score_correction_bias
         k = min(self.cache.prefetch_k, sc.shape[-1])
         return mx.argpartition(-sc, kth=k - 1, axis=-1)[..., :k]
 
@@ -429,19 +437,22 @@ class StreamingSwitchGLU(nn.Module):
         return y.reshape(*lead, k, -1)
 
 
-def _hook_norm(norm, layer_idx, cache):
-    """Record each layer's last-token residual (the input of pre_feedforward_layernorm)."""
-    cls = type(norm)
+def _hook_moe(moe, layer_idx, cache):
+    """Record each layer's last-token router input (the residual stream after the pre-feedforward norm)."""
+    cls = type(moe)
 
     class Hooked(cls):
         def __call__(self, x):
             cache.resid[layer_idx] = x[:, -1:] if x.shape[1] <= 8 else None
             return super().__call__(x)
 
-        def plain(self, x):  # the original norm without recording (used for predictions)
-            return cls.__call__(self, x)
+    moe.__class__ = Hooked
 
-    norm.__class__ = Hooked
+
+def _gain_ratio(num, den):
+    """num / den per channel; 0 where den is ~0 (that channel carries nothing to rescale)."""
+    num, den = num.astype(mx.float32), den.astype(mx.float32)
+    return mx.where(mx.abs(den) > 1e-6, num / mx.where(mx.abs(den) > 1e-6, den, 1.0), 0.0)
 
 
 def enable_prefetch(model, cache, k=4):
@@ -449,9 +460,14 @@ def enable_prefetch(model, cache, k=4):
     cache.prefetch_k = k
     layers = model.layers
     for i, layer in enumerate(layers):
-        _hook_norm(layer.pre_feedforward_layernorm, i, cache)
+        _hook_moe(layer.mlp, i, cache)
         nxt = layers[i + 1] if i + 1 < len(layers) else None
-        object.__setattr__(layer.mlp.switch_mlp, "next_layer", nxt)
+        glu = layer.mlp.experts
+        object.__setattr__(glu, "next_layer", nxt)
+        if nxt is not None:
+            ratio = _gain_ratio(nxt.pre_feedforward_layernorm.weight, layer.pre_feedforward_layernorm.weight)
+            mx.eval(ratio)
+            object.__setattr__(glu, "ratio", ratio)
 
 
 def split_slots(total, num_layers, weights=None):
@@ -460,10 +476,10 @@ def split_slots(total, num_layers, weights=None):
     return np.maximum(1, np.floor(w / w.sum() * total)).astype(int).tolist()
 
 
-def build_streaming_model(model_dir, model_module, cache_gb=None, slots_per_layer=None,
-                          layer_weights=None, group_max=48, nocache=True, threads=24,
-                          reserve_gb=10.0, prefetch_k=0, prefetch_threads=16, verbose=True):
-    """Build `model_module.Model` with dense weights resident and experts streamed.
+def build_streaming_model(model_dir, cache_gb=None, slots_per_layer=None, layer_weights=None, group_max=48,
+                          nocache=True, threads=24, reserve_gb=10.0, prefetch_k=0, prefetch_threads=16,
+                          verbose=True):
+    """Load mlx-lm's `muse_spark` with the dense weights resident and the experts streamed.
 
     The expert slabs get `slots_per_layer` slots per layer (an int or a list), or, by
     default, `cache_gb` worth of slots split over the layers (`layer_weights` = relative
@@ -471,60 +487,43 @@ def build_streaming_model(model_dir, model_module, cache_gb=None, slots_per_laye
     prefetch_k>0 turns on speculative next-layer reads (top-k predicted experts).
     """
     model_dir = Path(model_dir)
-    config = json.loads((model_dir / "config.json").read_text())
-    quant = config["quantization"]
-    args = model_module.ModelArgs.from_dict(config)
-    model = model_module.Model(args)  # expert tensors stay lazy and are never evaluated
+    # lazy=True: nothing is read yet. Without a vision_config the model has no vision tower (text only)
+    # and its weights are dropped. mlx-lm builds each module with the bits the checkpoint gives it.
+    model, config = load_model(model_dir, lazy=True, model_config={"vision_config": None})
+    text = model.args.text
+    n_layers, n_experts = text.num_hidden_layers, text.num_local_experts
 
-    # Dense weights: mx.load is lazy, so only what we evaluate below is read.
-    weights = {}
-    for path in sorted(glob.glob(str(model_dir / "model*.safetensors"))):
-        for k, v in mx.load(path).items():
-            if ".mlp.switch_mlp." not in k:
-                weights[k] = v
-    weights = model.sanitize(weights)
-
-    store = ExpertStore(model_dir, args.num_hidden_layers, args.num_local_experts,
-                        nocache=nocache, threads=threads, prefetch_threads=prefetch_threads)
-
-    resident = sum(v.nbytes for v in weights.values())
+    store = ExpertStore(model_dir, n_layers, n_experts, nocache=nocache, threads=threads,
+                        prefetch_threads=prefetch_threads)
+    resident = sum(v.nbytes for k, v in tree_flatten(model.parameters()) if not _EXPERT_RE.match(k))
     if slots_per_layer is None:
         if cache_gb is None:
             info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
             limit = info["max_recommended_working_set_size"] / GB
             cache_gb = max(1.0, limit - resident / GB - reserve_gb)
-        slots_per_layer = split_slots(int(cache_gb * GB // store.expert_bytes),
-                                      args.num_hidden_layers, layer_weights)
+        slots_per_layer = split_slots(int(cache_gb * GB // store.expert_bytes), n_layers, layer_weights)
     elif isinstance(slots_per_layer, int):
-        slots_per_layer = [slots_per_layer] * args.num_hidden_layers
+        slots_per_layer = [slots_per_layer] * n_layers
     cache = ExpertCache(store, slots_per_layer)
 
     for i, layer in enumerate(model.layers):
-        old = layer.mlp.switch_mlp
-        template = SwitchGLU(old.gate_proj.input_dims, old.gate_proj.output_dims, 1,
-                             activation=old.activation)
-        nn.quantize(template, group_size=quant["group_size"], bits=quant["bits"],
-                    mode=quant.get("mode", "affine"))
-        layer.mlp.switch_mlp = StreamingSwitchGLU(i, cache, template, group_max=group_max)
-
-    nn.quantize(
-        model, group_size=quant["group_size"], bits=quant["bits"],
-        mode=quant.get("mode", "affine"),
-        class_predicate=lambda p, m: hasattr(m, "to_quantized") and f"{p}.scales" in weights,
-    )
-    model.eval()
-    model.load_weights(list(weights.items()), strict=False)
-
-    have = {k for k, _ in tree_flatten(model.parameters())}
-    missing = sorted(k for k in have - set(weights) if ".switch_mlp." not in k)
-    extra = sorted(set(weights) - have)
-    if missing or extra:
-        raise ValueError(f"weight mismatch; missing {missing[:5]} extra {extra[:5]}")
-    mx.eval(model.parameters())
+        old = layer.mlp.experts
+        qs = [getattr(old, p) for p in PROJS]
+        if not all(hasattr(q, "scales") and getattr(q, "biases", None) is not None
+                   and getattr(q, "global_scale", None) is None for q in qs) \
+                or len({(q.group_size, q.bits, q.mode) for q in qs}) != 1:
+            raise ValueError(f"layer {i}: the experts must be affine-quantized with one setting "
+                             "(an unquantized or mixed-precision layer cannot be streamed)")
+        template = SwitchGLU(text.moe_hidden_size, text.moe_intermediate_size, 1, activation=old.activation)
+        nn.quantize(template, group_size=qs[0].group_size, bits=qs[0].bits, mode=qs[0].mode)
+        layer.mlp.experts = StreamingSwitchGLU(i, cache, template, getattr(old, "post_expert_norm", None),
+                                               group_max=group_max)
+        del old, qs
+    mx.eval(model.parameters())  # the dense weights; the experts left the model above and are never read
     if prefetch_k > 0:
         enable_prefetch(model, cache, prefetch_k)
     if verbose:
-        total = args.num_hidden_layers * args.num_local_experts
+        total = n_layers * n_experts
         print(f"resident {resident / GB:.1f} GB, expert slabs {cache.capacity * store.expert_bytes / GB:.1f} GB "
               f"({cache.capacity} of {total} experts, {min(cache.slots)}-{max(cache.slots)} per layer, "
               f"{store.expert_bytes / 2**20:.1f} MB each)"

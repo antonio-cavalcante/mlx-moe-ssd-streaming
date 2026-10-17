@@ -1,23 +1,26 @@
 # mlx-moe-ssd-streaming
 
-Goal: run `mlx-community/Muse-Spark-Open-816B-A42B-3bit` (816B-param MoE, 42B active, 359 GB on disk)
-on a 128 GB Mac by keeping only the dense weights in RAM and **streaming routed experts from SSD on demand**.
+Goal: run `mlx-community/Muse-Spark-Open-816B-A42B-oQ3e` (816B-param MoE, 42B active, 346 GiB on disk; since 2026-10-16,
+before that the uniform `...-3bit` conversion, see "Port to upstream" below) on a 128 GB Mac by keeping only the dense
+weights in RAM and **streaming routed experts from SSD on demand**.
 Stock mlx-lm cannot do this (it materializes all weights); we add a custom streaming expert layer on top of it.
+The model code is mlx-lm's OWN `muse_spark` (nothing vendored since 2026-10-16).
 
 ## Machine / environment
 - Apple M5 Max, 128 GB unified memory, macOS (Darwin). ~770 GB free disk as of 2026-10-15.
 - System python is 3.9 (too old). Use the venv: `.venv/bin/python` (uv, Python 3.12, mlx 0.32.4, mlx-lm 0.32.2 installed from git `main`).
-- mlx-lm `main` has a `muse_spark` architecture (PR #1976, merged 2026-10-15) but it uses a DIFFERENT layout (`model.language_model.layers.N.mlp.experts`, fused `qkvg_proj`, `_alpha/_beta` gates) and **cannot load this checkpoint**.
-  The mlx-community 3-bit checkpoint was converted with the closed PR #1975 (`model.layers.N.mlp.switch_mlp`, raw q/k/v/gate_proj, raw norm/gate weights).
-  So we vendor that version: `src/muse_spark_1975.py` (only the imports changed; I read all 481 lines, plain model math).
+- mlx-lm `main` has `muse_spark` (PR #1976, plus #1981 "hf names" of 2026-10-16 that moved it to the Hugging Face tensor
+  names: `model.language_model.layers.N.mlp.experts`, fused `qkvg_proj`, `_alpha/_beta` gates, fused Metal kernels).
+  Installed: commit `93e6d4a6`. The old 3-bit mlx-community conversion (closed PR #1975 layout, `model.layers.N.mlp.switch_mlp`)
+  cannot be loaded by it; the last commit that ran that layout (vendored `src/muse_spark_1975.py`) is `026d4d8`.
 - Reinstall if needed: `uv pip install --python .venv/bin/python "git+https://github.com/ml-explore/mlx-lm.git@main" huggingface_hub`
 
 ## Layout
-- `models/Muse-Spark-Open-816B-A42B-3bit/` - downloaded model (83 safetensors shards, 3.9-4.6 GB each).
-  Download: `.venv/bin/hf download mlx-community/Muse-Spark-Open-816B-A42B-3bit --local-dir models/Muse-Spark-Open-816B-A42B-3bit` (resumable; log in `logs/download.log`). Check completeness before use.
-- `src/muse_spark_1975.py` - vendored PR #1975 model (matches the checkpoint's key names and numerics).
-- `src/expert_stream.py` - the streaming layer: `ExpertStore` (parses safetensors headers, parallel `preadv` of one expert = 9 tensors by offset, F_NOCACHE), `ExpertCache` (per-layer slabs + LRU, prefetch bookkeeping, stats), `StreamingSwitchGLU` (drop-in for `SwitchGLU`: `mx.eval(inds)` -> slab lookup -> stock SwitchGLU math on a template whose weights ARE the slabs, indices = slot numbers; stacked fallback for prefill), `build_streaming_model()` (dense weights via lazy `mx.load`, strict key check, auto cache size).
-- `tests/test_tiny.py` - builds a tiny 3-bit bf16 checkpoint with the real key names in 2 shards and checks streaming == stock model (prefill, multi-group prefill, greedy decode, tiny cache with eviction). Run: `.venv/bin/python -I tests/test_tiny.py` (all pass as of 2026-10-15).
+- `models/Muse-Spark-Open-816B-A42B-oQ3e/` - the model (64 safetensors shards, 346 GiB; `logs/download-oq3e.log`), size-verified against the Hub.
+  Download: `.venv/bin/hf download mlx-community/Muse-Spark-Open-816B-A42B-oQ3e --local-dir models/Muse-Spark-Open-816B-A42B-oQ3e` (resumable). Check completeness before use.
+  `models/Muse-Spark-Open-816B-A42B-3bit/` (old conversion, 359 GB) is still on disk only for A/B runs with commit `026d4d8`; it can be deleted.
+- `src/expert_stream.py` - the streaming layer: `ExpertStore` (parses safetensors headers, parallel `preadv` of one expert = 9 tensors by offset, F_NOCACHE), `ExpertCache` (per-layer slabs + LRU, prefetch bookkeeping, stats), `StreamingSwitchGLU` (drop-in for `SwitchGLU`: `mx.eval(inds)` -> slab lookup -> stock SwitchGLU math on a template whose weights ARE the slabs, indices = slot numbers; stacked fallback for prefill), `build_streaming_model()` (mlx-lm's `load_model(lazy=True, model_config={"vision_config": None})` builds/quantizes the model per module and loads the dense weights; then each `layer.mlp.experts` is swapped for a `StreamingSwitchGLU` that also carries `post_expert_norm` (mlx-lm's MoE reads it off `experts`); auto cache size). Refuses experts that are not uniformly affine-quantized.
+- `tests/test_tiny.py` - builds a tiny checkpoint (upstream's `Model`, 2 shards, real key names, a few modules at 4/5/8 bits via config overrides, `lm_head` unquantized) and checks streaming == stock mlx-lm model (prefill, multi-group prefill, greedy decode, tiny cache with eviction). Run: `.venv/bin/python -I tests/test_tiny.py` (all pass as of 2026-10-15).
 - `run_stream.py` - CLI generation with the real model (`--prompt`, `--max-tokens`, `--cache-gb`, `--threads`, `--page-cache`, `--reasoning-effort`, `--hide-reasoning`, `--show-markup`); answer -> stdout, reasoning + tok/s + cache stats -> stderr.
 - `chat.py` + `src/chat_session.py` - interactive multi-turn chat (`ChatSession`: persistent KV cache, append-only; each turn feeds only the template delta = render(history+user) minus render(history); rebuilds the cache from `messages` if its state is in doubt; `/reset`, `/effort`, `/context`, `/stats`, multi-line `"""`). `src/cli_common.py` holds the args/loading/`Printer` shared with `run_stream.py`. Default `--reasoning-effort medium` (both programs), sampling defaults from the model's generation_config.json in chat (greedy in run_stream). The banner shows "Built with Muse Spark Open" (license requirement for UIs).
 - `tests/test_chat.py` - ChatSession on a tiny FLOAT32 checkpoint (bf16 tiny model is too noisy: a deliberately wrong history was within 0.02 of the right one; in float32 right = 0.8% of the logit spread, wrong = 70-100%). Run: `.venv/bin/python -I tests/test_chat.py`.
@@ -30,10 +33,10 @@ Stock mlx-lm cannot do this (it materializes all weights); we add a custom strea
 
 ## Model facts (from config + tensor headers)
 - 62 layers, hidden 8192, 256 routed experts, top-8, no shared experts, 3-bit affine quant, group size 64.
-- Expert weights are the `mlp.switch_mlp.{gate,up,down}_proj.{weight,scales,biases}` tensors, stacked with the **expert index as the leading axis** (e.g. weight `[256, 4096, 384]` U32), so one expert's slice of each tensor is contiguous in the file and can be read by byte offset.
-- Sizes: experts 349.5 GB total; everything else 9.7 GB (resident). One expert in one layer = ~22 MB (3 x 6.3 MB weights + 6 x 0.5 MB scales/biases).
+- Expert weights are the `mlp.experts.{gate,up,down}_proj.{weight,scales,biases}` tensors (`model.language_model.layers.N.`; `switch_mlp` in the old conversion), stacked with the **expert index as the leading axis** (e.g. weight `[256, 4096, 384]` U32), so one expert's slice of each tensor is contiguous in the file and can be read by byte offset.
+- Sizes (old 3-bit conversion; oQ3e has the same experts, 325.5 GiB, and 16.9 GiB resident): experts 349.5 GB total; everything else 9.7 GB (resident). One expert in one layer = ~22 MB (3 x 6.3 MB weights + 6 x 0.5 MB scales/biases).
 - Worst-case (cache-miss) read per token = 62 x 8 x 22 MB = ~10.9 GB.
-- In the mlx-lm code the MoE block is `MoE` in `muse_spark.py`: `pre_expert_proj` (8192->4096) -> `pre_expert_norm` -> `self.experts` (a stock `SwitchGLU`, called `self.experts(h, inds)`) -> `post_expert_norm_combine` -> `post_expert_proj`. `sanitize()` maps checkpoint name `switch_mlp` to module name `experts`. `pre/post_expert_proj` are small and stay resident.
+- In the mlx-lm code the MoE block is `MoE` in `muse_spark.py`: `pre_expert_proj` (8192->4096) -> `pre_expert_norm` -> `self.experts` (a stock `SwitchGLU`, called `self.experts(h, inds)`) -> `post_expert_norm_combine` (uses `self.experts.post_expert_norm`) -> `post_expert_proj`. `pre/post_expert_proj` are small and stay resident.
 - Also has attention layers with a sliding window (2048) and a vision/audio tower (ignore for text work).
 
 ## SSD benchmark (2026-10-15, M5 Max internal SSD, F_NOCACHE random reads, 48 GB file)
@@ -88,6 +91,32 @@ Everything in this repo uses GB = 2^30 bytes (`es.GB = 1 << 30`) and the GPU lim
 - Test pitfall: the tiny random MoE has near-tied routers, so even the STOCK model differs 10-35% (relative to the logit spread) between one-shot and token-by-token evaluation for some inputs. Logit comparisons against the stock model are only valid for the inputs `test_chat.py` already uses; for arbitrary text compare token histories (solo vs pooled session) or structure instead.
 - Mutation check: disabling any of disconnect polling, Content-Type check, Host check, connection cap, LRU choice, effort default, queue cap, cancelled-job skip, max_chars, UTF-8 check, `Connection: close` makes `test_lan.py` fail (scratchpad `mutate.sh`).
 - Ideas left: persist the system-prompt KV cache on disk (~25 s per new conversation); `stop` sequences; tool calling via the template's `<atem:...>` format; special-token text typed by a user (`<|eot|>`) is tokenized as the real special token (only affects that user's own conversation).
+
+## Port to upstream mlx-lm + oQ3e (2026-10-16)
+- Why: mlx-community re-uploaded the 3-bit repo on 2026-10-16 in upstream's layout (my local copy was the 2026-10-15 revision), and
+  also published `...-oQ3e`. The re-uploaded plain `...-3bit` keeps experts of layers 0 and 61 in bf16 (96 MiB each) and attention in bf16
+  (~40 GiB resident) - worse for streaming; not downloaded. oQ3e: every expert 3-bit/21 MiB, attention + pre/post_expert_proj at 4/5/8 bits
+  (per-module overrides in `config.json["quantization"]`), embeddings quantized, `lm_head` bf16; 16.9 GiB resident, 3901 slots (vs 4280).
+- Changes: key regex -> `model.language_model.layers.N.mlp.experts...`; loader = `mlx_lm.utils.load_model(lazy=True)` (no strict check of our own,
+  no quantization code of our own); text only via `model_config={"vision_config": None}` (drops the 3.6 GiB vision tower);
+  `post_expert_norm` lives on `StreamingSwitchGLU`. Prefetch predictor: upstream fuses the pre-feedforward norm into `norm_add_norm`, so
+  `pre_feedforward_layernorm.__call__` is never called; instead `MoE.__call__` is hooked (`_hook_moe`) and records ITS input (already normed by
+  layer l's gain), and the next router is applied to `x * (w_{l+1} / w_l)` (`_gain_ratio`, 0 where w_l ~ 0) = the next layer's norm of the same
+  stream. Router formula unchanged (sigmoid(logit * router_multiplier) + e_score_correction_bias, top-k). Prefetch used ~72% of what it read.
+- A/B on the real machine, 3 greedy prompts x 250 tokens, effort medium (scratchpad `ab/run.sh`): old code+old 3-bit 4.87 / 5.41 / 4.48 tok/s,
+  hit 89-91%, peak 98.9 GiB; new code+oQ3e 4.55 / 4.54 / 4.04 tok/s, hit 88-89%, peak 99.2 GiB. Prefill ~7 tok/s both. Perplexity on the same
+  2047 tokens (README + turns.py + LICENSE text): oQ3e 5.83 (NLL 1.763) vs old 3-bit 7.10 (NLL 1.961). Reasoning text of both is near-identical on the
+  prompts tried. Server smoke test on the real model: 17*23=391, 2nd turn reused 345 cached tokens (9.1 s vs 72 s), SIGINT exit in 1 s.
+- Test-suite pitfalls found (all tests pass; none needs the real model):
+  (1) upstream does `out.astype(lm_head.weight.dtype)`: a QUANTIZED tiny `lm_head` (uint32) truncates the hidden state to integers and every logit
+  comparison turns to noise; the real checkpoint keeps `lm_head` bf16, so the tiny one must too. (2) mlx's `gather_qmm` has a sorted path
+  (>= 64 index entries) and an unsorted one; stock `SwitchGLU` differs ~1e-3 between them even in float32, so multi-group prefill (subsets of
+  tokens) cannot be compared on logits - `test_tiny` compares the experts layer by layer. (3) upstream casts to bf16 internally, so one-shot vs chunked vs
+  token-by-token evaluation of the same text differ by ~0.3% in the hidden state; with a token-dependent router that flips a near-tied top-k choice
+  now and then (logits off by 10-60% for that history). `make_checkpoint(..., fixed_routing=True)` zeroes the router weights (bias only) for
+  `test_chat/test_server/test_lan`; `test_tiny` keeps a diverse router because it compares same-shape evaluations (bit-exact: 0 diff).
+  (4) `ROUTER_STD, BIAS_STD = 0.1, 1.0` in test_tiny keeps the noise floor at ~1-3% of the logit spread.
+- mlx-lm's `load_tokenizer(eos_token_ids=None)` only knows 200001 for this model; the config.json top-level `eos_token_id` list [200001, 200008] is still passed in `cli_common.load_all`.
 
 ## Notes
 - Stop tokens: config.json lists `eos_token_id` [200001 `<|end_of_text|>`, 200008 `<|eot|>`] but the tokenizer alone only knows 200001, so generation ran to `--max-tokens`. `run_stream.py` now passes the config list to the tokenizer loader (any new front end must do the same). The reasoning message ends with `<|eom|>` (200007), which is NOT a stop token: the user-facing answer (`<|start|>assistant to=user<|message|>...<|eot|>`) follows it.

@@ -18,7 +18,6 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
 import chat_session as cs  # noqa: E402
 import expert_stream as es  # noqa: E402
-import muse_spark_1975 as ms  # noqa: E402
 import test_tiny as tt  # noqa: E402
 
 SPECIALS = ["<|begin_of_text|>", "<|end_of_text|>", "<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
@@ -172,9 +171,9 @@ def main():
     tmp = Path(tempfile.mkdtemp(prefix="chat_ckpt_"))
     ok = True
     try:
-        ref = tt.make_checkpoint(tmp, mx.float32)
+        ref = tt.make_checkpoint(tmp, mx.float32, fixed_routing=True)
         tok = make_tokenizer()
-        model, cache = es.build_streaming_model(tmp, ms, slots_per_layer=6, prefetch_k=4, verbose=False)
+        model, cache = es.build_streaming_model(tmp, slots_per_layer=6, prefetch_k=4, verbose=False)
         sess = cs.ChatSession(model, tok, max_context=400, small_step=4, small_below=30, big_step=16)
 
         texts = ["hello there", "and now a much longer second message so that it takes the big prefill path",

@@ -16,31 +16,59 @@ from mlx.utils import tree_flatten, tree_unflatten
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 import expert_stream as es  # noqa: E402
-import muse_spark_1975 as ms  # noqa: E402
+from mlx_lm.models import muse_spark as ms  # noqa: E402
 
+LAYERS = 5
+THETA = [500000.0, 0, 500000.0, 500000.0, 0]      # 0 = no RoPE (the full-attention layers of the real model)
 CFG = dict(
-    model_type="muse_spark", hidden_size=256, num_hidden_layers=5, intermediate_size=512,
-    num_attention_heads=4, num_key_value_heads=2, head_dim=64, vocab_size=512,
-    moe_hidden_size=128, moe_intermediate_size=128, num_local_experts=16,
-    num_experts_per_tok=4, sliding_window=8, max_position_embeddings=1024,
-    quantization=dict(group_size=64, bits=3, mode="affine"),
+    model_type="muse_spark",
+    text_config=dict(
+        hidden_size=256, num_attention_heads=4, num_key_value_heads=2, head_dim=64, num_hidden_layers=LAYERS,
+        vocab_size=512, rms_norm_eps=1e-5, post_norm_eps=1e-8, rope_parameters={"rope_theta": 500000.0},
+        layer_rope_theta=THETA, sliding_window=8, final_logit_softcapping=20.0, output_multiplier=0.17677669529663687,
+        layer_types=["sliding_attention", "full_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        num_local_experts=16, num_experts_per_tok=4, moe_hidden_size=128, moe_intermediate_size=128,
+        mlp_layer_types=["sparse"] * LAYERS),
 )
+# Like the real checkpoint: 3 bits by default, a few modules at other widths.
+# Router: a big per-expert bias keeps the chosen experts stable when mlx-lm's bf16 casts add ~0.3% noise
+# between two ways of evaluating the same text (one shot vs chunks vs token by token).
+ROUTER_STD, BIAS_STD = 0.1, 1.0
+MIXED = {
+    "model.language_model.layers.1.self_attn.qkvg_proj": dict(group_size=64, bits=4, mode="affine"),
+    "model.language_model.layers.2.mlp.pre_expert_proj": dict(group_size=64, bits=5, mode="affine"),
+    "model.language_model.layers.3.self_attn.o_proj": dict(group_size=64, bits=8, mode="affine"),
+}
+CFG["quantization"] = dict(group_size=64, bits=3, mode="affine", **MIXED)
 
 
-def make_checkpoint(out: Path, dtype=mx.bfloat16):
+def make_checkpoint(out: Path, dtype=mx.bfloat16, fixed_routing=False):
+    """`fixed_routing`: the router ignores the token (zero weights, per-expert bias only), so every token of a layer
+    uses the same experts. mlx-lm's bf16 casts make two ways of evaluating the same text (one shot, chunks, token by
+    token) differ by ~0.3%, which flips a near-tied top-k choice now and then and changes the logits by tens of
+    percent. Tests that compare a cache with a fresh prefill need to be immune to that."""
     mx.random.seed(0)
     model = ms.Model(ms.ModelArgs.from_dict(CFG))
-    # Randomize everything so routing/norms/gates are non-degenerate.
+    # Randomize everything so routing/norms/gates are non-degenerate (the experts' own init is fine).
     flat = tree_flatten(model.parameters())
-    noise = [(k, mx.random.normal(v.shape) * 0.05 if v.size > 1 and "switch_mlp" not in k else v)
+    noise = [(k, v if v.size <= 1 or ".mlp.experts.gate_proj" in k or ".mlp.experts.up_proj" in k
+              or ".mlp.experts.down_proj" in k
+              else 1 + mx.random.normal(v.shape) * 0.1 if "norm" in k and k.endswith("weight")
+              else mx.zeros(v.shape) if fixed_routing and k.endswith("mlp.gate.weight")
+              else mx.random.normal(v.shape) * (ROUTER_STD if k.endswith("mlp.gate.weight")
+                                                else BIAS_STD if k.endswith("e_score_correction_bias") else 0.05))
              for k, v in flat]
     model.update(tree_unflatten(noise))
-    keep_fp32 = model.cast_predicate  # router + residual gates stay float32
+    for layer in model.layers:                # the residual gates' coefficients, from random gates
+        layer.add_attn_alpha, layer.add_attn_beta = ms.residual_gate_coefficients(mx.random.normal((256,)) * 0.5)
+        layer.add_ffn_alpha, layer.add_ffn_beta = ms.residual_gate_coefficients(mx.random.normal((256,)) * 0.5)
+    keep_fp32 = model.cast_predicate          # the residual gates' coefficients stay float32
     model.update(tree_unflatten(
-        [(k, v.astype(dtype) if keep_fp32(k) else v)
-         for k, v in tree_flatten(model.parameters())]))
+        [(k, v.astype(dtype) if keep_fp32(k) else v) for k, v in tree_flatten(model.parameters())]))
     q = CFG["quantization"]
-    nn.quantize(model, group_size=q["group_size"], bits=q["bits"], mode=q["mode"])
+    # (mlx-lm casts the final hidden state to lm_head.weight.dtype, so like the real checkpoint it stays unquantized)
+    nn.quantize(model, group_size=q["group_size"], bits=q["bits"], mode=q["mode"],
+                class_predicate=lambda p, m: MIXED.get(p, hasattr(m, "to_quantized") and p != "lm_head"))
     mx.eval(model.parameters())
 
     params = dict(tree_flatten(model.parameters()))
@@ -63,6 +91,11 @@ def check(name, a, b, tol=2e-2):
     return ok
 
 
+def check_true(name, cond):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}")
+    return cond
+
+
 def logits(model, toks, cache=None):
     out = model(mx.array(toks)[None], cache=cache)
     mx.eval(out)
@@ -76,20 +109,30 @@ def main():
         ref = make_checkpoint(tmp)
 
         def stream(slots, group_max, prefetch_k=0):
-            return es.build_streaming_model(tmp, ms, slots_per_layer=slots, group_max=group_max,
+            return es.build_streaming_model(tmp, slots_per_layer=slots, group_max=group_max,
                                             prefetch_k=prefetch_k, verbose=False)
 
         mx.clear_cache()
         m, c = stream(16, 48)
-        print(f"all experts would be {CFG['num_hidden_layers'] * CFG['num_local_experts'] * c.store.expert_bytes / 2**20:.1f} MB; "
+        print(f"all experts would be {LAYERS * 16 * c.store.expert_bytes / 2**20:.1f} MB; "
               f"slabs {c.capacity} experts")
 
         prompt = np.random.RandomState(1).randint(0, 512, 40).tolist()
 
-        # 1. prefill (many tokens -> stacked path; multi-group path with group_max=4)
-        for gm in (48, 4):
+        # 1. prefill (many tokens -> stacked path). One group runs the very same call as the stock model (bit
+        #    exact). Several groups run it on subsets of the tokens, which takes mlx's UNSORTED gather_qmm kernel
+        #    instead of the sorted one (>= 64 entries): the stock SwitchGLU itself differs by ~1e-3 between the
+        #    two, and the tiny random router amplifies that through 5 layers. So compare the experts layer by
+        #    layer there instead of the logits.
+        m, c = stream(16, 48)
+        ok &= check("prefill 40 tok, one group", logits(ref, prompt), logits(m, prompt), tol=1e-6)
+        for gm in (8, 4, 2):
             m, c = stream(16, gm)
-            ok &= check(f"prefill 40 tok, group_max={gm}", logits(ref, prompt), logits(m, prompt))
+            for l in range(LAYERS):
+                h = mx.random.normal((1, 40, 128)).astype(mx.bfloat16)
+                idx = mx.random.randint(0, 16, (1, 40, 4)).astype(mx.uint32)
+                ok &= check(f"layer {l} experts, 40 tok, group_max={gm}", ref.layers[l].mlp.experts(h, idx),
+                            m.layers[l].mlp.experts(h, idx), tol=2e-2)
 
         # 2. greedy decode with KV cache. slots/layer: 16 = everything fits, 6 = eviction,
         #    4 = exactly top-k, 3 = fewer slots than a token needs (stacked fallback)
@@ -108,11 +151,14 @@ def main():
             print(f"  {'PASS' if same else 'FAIL'}  slots={slots} prefetch={pf}: greedy tokens ref={toks_r} stream={toks_s}")
             print("   ", c.summary())
             ok &= c.resident <= c.capacity
-            if pf and slots >= CFG["num_experts_per_tok"]:
+            if pf and slots >= 4:
                 ok &= c.stats["pf_issued"] > 0
+            if (slots, pf) == (4, 4):         # top-4 of 16 experts: guessing would hit 25% of the time
+                used = c.stats["pf_used"] / max(c.stats["pf_issued"], 1)
+                ok &= check_true(f"the next-layer predictor beats chance (used {used:.0%} of prefetched)", used > 0.4)
             if slots == 16:
                 ok &= c.stats["hits"] > 0
-            if slots < CFG["num_experts_per_tok"]:
+            if slots < 4:
                 ok &= c.stats["fallback"] > 8  # every decode step must take the stacked path
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
