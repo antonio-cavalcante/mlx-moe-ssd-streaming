@@ -30,6 +30,7 @@ import os
 import re
 import struct
 import sys
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -94,6 +95,41 @@ def _join(futures):
         f.result()
 
 
+class IOMeter:
+    """Counts what the SSD reads really do: bytes and the wall time with at least one read in flight
+    ('busy'), for demand reads (a layer is waiting for them) and prefetch reads (speculative)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.inflight, self.since = 0, 0.0
+        self.busy_s = 0.0
+        self.bytes = {"demand": 0, "prefetch": 0}
+        self.thread_s = 0.0          # summed duration of all reads (>= busy_s when reads overlap)
+
+    def start(self):
+        t = time.perf_counter()
+        with self.lock:
+            if self.inflight == 0:
+                self.since = t
+            self.inflight += 1
+        return t
+
+    def end(self, t0, kind, nbytes):
+        t = time.perf_counter()
+        with self.lock:
+            self.inflight -= 1
+            if self.inflight == 0:
+                self.busy_s += t - self.since
+            self.bytes[kind] += nbytes
+            self.thread_s += t - t0
+
+    def snapshot(self):
+        with self.lock:
+            busy = self.busy_s + (time.perf_counter() - self.since if self.inflight else 0.0)
+            return dict(busy_s=busy, thread_s=self.thread_s, demand_bytes=self.bytes["demand"],
+                        prefetch_bytes=self.bytes["prefetch"])
+
+
 class ExpertStore:
     """Reads single experts (9 tensors each) out of the safetensors shards."""
 
@@ -127,26 +163,32 @@ class ExpertStore:
         self.expert_bytes = sum(self.loc[(0, p, k)][2] for p, k in PIECES)
         self.pool = ThreadPoolExecutor(threads)  # demand reads
         self.pf_pool = ThreadPoolExecutor(prefetch_threads)  # speculative reads
+        self.io = IOMeter()
 
-    def _fill(self, fd, off, view):
+    def _fill(self, fd, off, view, kind="demand"):
         """preadv until `view` (a writable uint8 buffer) is full."""
+        t0 = self.io.start()
         done = 0
-        while done < len(view):
-            got = os.preadv(fd, [memoryview(view)[done:]], off + done)
-            if got <= 0:
-                raise IOError(f"short read at offset {off + done}")
-            done += got
+        try:
+            while done < len(view):
+                got = os.preadv(fd, [memoryview(view)[done:]], off + done)
+                if got <= 0:
+                    raise IOError(f"short read at offset {off + done}")
+                done += got
+        finally:
+            self.io.end(t0, kind, done)
 
     def fill_slot(self, layer, expert, views, slot, pool, chunk=None):
         """Queue reads of one expert's 9 tensors into row `slot` of the layer's slab
         (`views[i]` = flat writable uint8 view of tensor i's slab). Returns the futures."""
         chunk = self.chunk if chunk is None else chunk
+        kind = "demand" if pool is self.pool else "prefetch"
         futs = []
         for i in range(len(PIECES)):
             fd, base, stride, _, _ = self.loc[(layer,) + PIECES[i]]
             view = views[i][slot * stride:(slot + 1) * stride]
             step = chunk or stride
-            futs.extend(pool.submit(self._fill, fd, base + expert * stride + o, view[o:o + step])
+            futs.extend(pool.submit(self._fill, fd, base + expert * stride + o, view[o:o + step], kind)
                         for o in range(0, stride, step))
         return futs
 

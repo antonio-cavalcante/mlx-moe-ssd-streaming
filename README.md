@@ -23,7 +23,18 @@ Apple M5 Max, 128 GB unified memory, internal SSD, macOS. Three greedy 250-token
 | Resident dense weights | 16.9 GB |
 | Expert cache (slabs) | 80.0 GB = 3,901 of 15,872 experts (25%) |
 | Peak memory | 99.2 GB (GPU recommended working set: 107.5 GB) |
-| Decode cache hit rate | 88-89% |
+| Expert lookups at decode | 83-84% already in RAM, 5% prefetched just in time, 11% demand misses |
+| SSD traffic at decode | ~1.9 GB per token, busy ~70% of the time (~8.2 GB/s average, 12 GB/s while reading) |
+
+Longer prompts (`bench.py`, summarizing 2k / 6k / 12k tokens of source code, 200 greedy tokens each):
+decode 4.25 / 4.26 / 4.37 tokens/s, prompt processing 39 / 55 / 61 tokens/s, peak 103.5 GB. Context length barely
+changes decoding, since only 16 of the layers keep a full-length KV cache.
+
+**Why the SSD looks busy all the time with an 88% hit rate.** The rate counts lookups, not time or bytes. A
+miss moves 21 MB at ~10 GB/s; a hit moves the same 21 MB at memory speed, 50x faster. So the ~11% of lookups
+that miss (plus the ~40 speculative reads per token, a third of which go unused) cost about 1.9 GB per token of SSD traffic, ~0.2 s
+of a ~0.23 s token. The SSD is the bottleneck, which is why more cache slots help more than anything else.
+`bench.py` measures this (our own `preadv` counters, cross-checked against `iostat`, which agrees within ~10%).
 
 These are single-machine, short-run numbers, not a benchmark suite. Speed depends on your
 SSD, memory bandwidth and the text being generated. `CLAUDE.md` has the full development
@@ -218,6 +229,7 @@ the printer.
 | `src/chat_session.py` | multi-turn conversation with a persistent KV cache |
 | `src/cli_common.py` | arguments, model loading and output helpers shared by the two programs |
 | `run_stream.py` | one-shot generation with timing and cache statistics |
+| `bench.py` | one benchmark generation from a long prompt: speed, how lookups were served, SSD bytes and busy time, optional `iostat` |
 | `chat.py` | interactive chat |
 | `src/openai_server.py` | OpenAI-compatible HTTP server logic on top of `ChatSession` |
 | `serve.py` | starts the server |

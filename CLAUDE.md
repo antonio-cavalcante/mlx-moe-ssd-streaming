@@ -118,6 +118,21 @@ Everything in this repo uses GB = 2^30 bytes (`es.GB = 1 << 30`) and the GPU lim
   (4) `ROUTER_STD, BIAS_STD = 0.1, 1.0` in test_tiny keeps the noise floor at ~1-3% of the logit spread.
 - mlx-lm's `load_tokenizer(eos_token_ids=None)` only knows 200001 for this model; the config.json top-level `eos_token_id` list [200001, 200008] is still passed in `cli_common.load_all`.
 
+## SSD busy-time instrumentation + long prompts (2026-10-16)
+- `IOMeter` (in `expert_stream.py`, `ExpertStore.io`): every `preadv` is counted by kind (demand / prefetch) with bytes and the wall time
+  during which >= 1 read is in flight ('busy'). `bench.py` (needs `--corpus FILE`, `--context-tokens N`, `--iostat`) prints it next to `iostat -d -w 1 disk0`.
+  Our counters and iostat agree within ~10% (iostat lower, mean 7.4-7.8 GB/s vs 8.1-8.4).
+- The printed 'hit rate' includes prefetched experts (`hits` = in RAM + claimed prefetches; `pf_used` is the claimed part). Split at decode:
+  ~84% in RAM, ~5% prefetched, ~11% demand miss (of 496 lookups/token).
+- Answer to 'why is the disk busy all the time at 88% hits': hit rate is by lookups, but a miss costs ~50x the time of a hit. SSD traffic is ~1.9 GB/token
+  (62 demand misses + ~40 prefetches, ~30% of prefetches unused) = busy ~70% of decode wall time at ~12 GB/s while busy (8.2 average), 15 reads in flight on average.
+  Decode wall time: waiting for demand reads 46-48%, prefetch 5-7%, GPU sync ~39%. SSD is the bottleneck; capacity (slots) is the lever.
+- A/B on 2161 / 6162 / 12162-token prompts (corpus = mlx_lm sources, summarize request, 200 greedy tokens, scratchpad `big/run.sh`):
+  new (oQ3e) decode 4.25 / 4.26 / 4.37 tok/s, prefill 39 / 55 / 61 tok/s, peak 103.5 GiB; old (3-bit, commit 026d4d8 + meter patch) 4.68 / 4.47 / 4.68, 40 / 58 / 62, peak 99.7-100.6.
+  So the old checkpoint is ~6-10% faster at decode (more slots: 4280 vs 3901; fewer misses 10.3-10.9% vs 11.1-11.4%), prefill equal within ~5%.
+  New peak is ~3-4 GiB higher than the old one and constant from 2k to 12k tokens: it is the prefill stack/temporaries, not the KV cache.
+- Test pitfall: `tests/test_store.py` replaces `store._fill` with a fault injector; it must accept `*args, **kw` (`_fill` now takes `kind`).
+
 ## Notes
 - Stop tokens: config.json lists `eos_token_id` [200001 `<|end_of_text|>`, 200008 `<|eot|>`] but the tokenizer alone only knows 200001, so generation ran to `--max-tokens`. `run_stream.py` now passes the config list to the tokenizer loader (any new front end must do the same). The reasoning message ends with `<|eom|>` (200007), which is NOT a stop token: the user-facing answer (`<|start|>assistant to=user<|message|>...<|eot|>`) follows it.
 - Keep temp files (benchmark scripts, test data) in the session scratchpad, not in the project; delete large test files.

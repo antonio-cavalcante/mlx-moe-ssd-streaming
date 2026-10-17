@@ -111,11 +111,11 @@ def cache_tests(tmp):
     real = store._fill
     calls = []
 
-    def flaky(fd, off, view):
+    def flaky(*a, **kw):
         calls.append(1)
         if len(calls) == 2:
             raise OSError("injected read error")
-        return real(fd, off, view)
+        return real(*a, **kw)
 
     l = 2
     cache.lookup(l, [0, 1])
@@ -151,6 +151,22 @@ def cache_tests(tmp):
     cache.lookup(l, [1])             # nobody asked for 8: a failed speculative read is just dropped
     check("failed unclaimed prefetch is dropped quietly", 8 not in cache.order[l] and 8 not in cache.pending[l]
           and intact(cache, l))
+
+    print("IOMeter")
+    check("no read left 'in flight' after failed reads", store.io.inflight == 0)
+    l = 1
+    cache.lookup(l, [0, 1, 2, 3])        # settle any earlier prefetch of this layer
+    cold = [e for e in range(store.num_experts) if e not in cache.order[l] and e not in cache.pending[l]]
+    a = store.io.snapshot()
+    cache.lookup(l, cold[:3])
+    cache.prefetch(l, cold[3:5])
+    for _, futs in list(cache.pending[l].values()):
+        wait(futs)
+    b = store.io.snapshot()
+    check("demand bytes = 3 experts", b["demand_bytes"] - a["demand_bytes"] == 3 * store.expert_bytes)
+    check("prefetch bytes = 2 experts", b["prefetch_bytes"] - a["prefetch_bytes"] == 2 * store.expert_bytes)
+    check("busy time grew, never more than the summed read time",
+          0 < b["busy_s"] - a["busy_s"] <= b["thread_s"] - a["thread_s"] + 1e-6)
 
     print("ExpertCache: file truncated under us")
     l = 0
