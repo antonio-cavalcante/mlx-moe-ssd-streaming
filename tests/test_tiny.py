@@ -160,6 +160,57 @@ def main():
                 ok &= c.stats["hits"] > 0
             if slots < 4:
                 ok &= c.stats["fallback"] > 8  # every decode step must take the stacked path
+
+        # 3. the learned predictor: a linear map per layer to the next layers' router logits. Here it is built
+        #    from the routers themselves (what training starts from), so it must beat chance; prefetching must
+        #    never change the output, with one or two layers of lookahead.
+        print("learned predictor")
+        ok &= check_true("margin_threshold: first calibrated bin at tau", es.margin_threshold([.1, .2, .3], [.2, .5, .7, .9], .65) == .2)
+        ok &= check_true("margin_threshold: every margin qualifies", es.margin_threshold([.1], [.9, .9], .65) == float("-inf"))
+        ok &= check_true("margin_threshold: none qualifies", es.margin_threshold([.1], [.1, .2], .65) == float("inf"))
+        D, E = 256, 16
+
+        def router_map(l, d):
+            gate = ref.layers[l + d].mlp.gate.weight.astype(mx.float32)
+            ratio = es._gain_ratio(ref.layers[l + d].pre_feedforward_layernorm.weight,
+                                   ref.layers[l].pre_feedforward_layernorm.weight)
+            return np.array(mx.concatenate([ratio[:, None] * gate.T, mx.zeros((1, E))]).astype(mx.float16))
+
+        pred = {}
+        for d, suffix in ((1, ""), (2, "2")):
+            pred["V" + suffix] = np.stack([router_map(l, d) for l in range(LAYERS - d)])
+            pred["edges" + suffix] = np.tile(np.linspace(-0.5, 0.5, 63), (LAYERS - d, 1))
+            pred["p" + suffix] = np.tile(np.linspace(0.0, 1.0, 64), (LAYERS - d, 1))   # margin >= 0 <=> in the top 8
+        path1, path2 = tmp / "pred1.npz", tmp / "pred2.npz"
+        np.savez(path1, **{k: v for k, v in pred.items() if not k.endswith("2")})
+        np.savez(path2, **pred)
+        try:
+            es.LearnedPredictor(path1, 0.5, lookahead=2)
+            ok &= check_true("lookahead 2 without a second set is refused", False)
+        except ValueError:
+            ok &= check_true("lookahead 2 without a second set is refused", True)
+        n_calls = {}
+        for path, look in ((path1, 1), (path2, 2)):
+            m, c = es.build_streaming_model(tmp, slots_per_layer=6, prefetch_k=4, predictor=path, prefetch_p=0.5,
+                                            lookahead=look, verbose=False)
+            calls, real_prefetch = [], c.prefetch
+            c.prefetch = lambda l, ids, calls=calls, real=real_prefetch: (calls.append(l), real(l, ids))[1]
+            n_calls[look] = calls
+            rc, sc = ref.make_cache(), m.make_cache()
+            lr, ls = logits(ref, prompt, rc), logits(m, prompt, sc)
+            toks_r, toks_s = [], []
+            for _ in range(8):
+                tr, ts = int(mx.argmax(lr[0, -1])), int(mx.argmax(ls[0, -1]))
+                toks_r.append(tr); toks_s.append(ts)
+                lr, ls = logits(ref, [tr], rc), logits(m, [ts], sc)
+            ok &= check_true(f"learned predictor, lookahead {look}: greedy tokens equal the stock model", toks_r == toks_s)
+            used = c.stats["pf_used"] / max(c.stats["pf_issued"], 1)
+            print("   ", c.summary())
+            ok &= check_true(f"lookahead {look}: it prefetches, and beats chance ({used:.0%} used; guessing = 25%)",
+                             c.stats["pf_issued"] > 0 and used > 0.4)
+            ok &= check_true(f"lookahead {look}: slots all accounted for", c.resident <= c.capacity)
+        ok &= check_true(f"lookahead 2 prefetches for two layers ahead too ({len(n_calls[2])} vs {len(n_calls[1])} calls)",
+                         len(n_calls[2]) > len(n_calls[1]))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("ALL PASS" if ok else "FAILURES")

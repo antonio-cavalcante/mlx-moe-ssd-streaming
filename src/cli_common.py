@@ -22,6 +22,12 @@ def add_model_args(ap, root):
     ap.add_argument("--threads", type=int, default=24, help="parallel SSD reads")
     ap.add_argument("--prefetch-k", type=int, default=4,
                     help="speculatively read the top-k predicted experts of the next layer (0 = off)")
+    ap.add_argument("--predictor", default=str(root / "meta/predictor.npz"),
+                    help="learned next-layer predictor (tools/train_predictor.py); 'none' = plain top-k of the next router")
+    ap.add_argument("--prefetch-p", type=float, default=0.65,
+                    help="with --predictor: read experts the predictor is at least this sure about (lower = more reads)")
+    ap.add_argument("--lookahead", type=int, choices=[1, 2], default=None,
+                    help="with --predictor: layers ahead to prefetch (default: as many as the file has; 2 gives the SSD more time)")
     ap.add_argument("--pf-threads", type=int, default=16, help="parallel SSD reads for prefetch")
     ap.add_argument("--layer-weights", default=str(root / "meta/layer_weights.json"),
                     help="JSON with per-layer relative slab sizes ('equal' = same slots for every layer)")
@@ -61,7 +67,9 @@ def load_all(args, root):
     model, cache = es.build_streaming_model(
         args.model, cache_gb=args.cache_gb, group_max=args.group_max,
         nocache=not args.page_cache, threads=args.threads, reserve_gb=args.reserve_gb,
-        prefetch_k=args.prefetch_k, prefetch_threads=args.pf_threads, layer_weights=layer_weights)
+        prefetch_k=args.prefetch_k, prefetch_threads=args.pf_threads, layer_weights=layer_weights,
+        predictor=args.predictor if args.predictor != "none" and Path(args.predictor).exists() else None,
+        prefetch_p=args.prefetch_p, lookahead=args.lookahead)
     # The tokenizer alone only knows <|end_of_text|>; the model ends a turn with <|eot|>. Both are in config.json.
     cfg = json.loads((Path(args.model) / "config.json").read_text())
     eos = cfg.get("eos_token_id") or cfg.get("text_config", {}).get("eos_token_id")

@@ -38,6 +38,27 @@ Prefetch (`--prefetch-k`, default 4) does not re-read cached experts; with it of
 with it on 17.5% need the SSD, but 5% of them arrive early: +16% SSD bytes (a third of the prefetches go unused) for ~8% faster decoding.
 `bench.py` measures this (our own `preadv` counters, cross-checked against `iostat`, which agrees within ~10%).
 
+### Prefetch predictor
+
+While layer l runs, the next layers' experts are guessed and read in the background. The simple guess (default without a
+predictor file) applies layer l+1's router to layer l's stream. A **learned predictor** is better: per layer a linear map
+(fitted by ridge regression from recorded activations, starting from that router) from layer l's router input to the router
+logits of layers l+1 and l+2, plus a calibration of "score margin -> chance the expert is really chosen"; only experts it is at
+least `--prefetch-p` (default 0.65) sure about are read. Held-out text (`argparse.py`, 1000 prompt tokens, 300 greedy tokens):
+
+| prefetch | decode tokens/s | SSD per token | of the prefetched reads, used |
+|---|---|---|---|
+| none (`--prefetch-k 0`) | 4.27 | 1.50 GB | - |
+| next router, top-4 (`--predictor none`) | 4.62 | 1.73 GB | 68% |
+| learned, 1 layer ahead, P>=0.65 | 4.70 | 1.62 GB | 86% |
+| **learned, 2 layers ahead, P>=0.65** (default) | **4.86** | 1.70 GB | 81% |
+
+Better guesses alone gain little (+2%): a read issued one layer ahead has ~1-2 ms to arrive, so it often does not, and the
+decode just waits for the prefetch instead of the demand read. Two layers ahead gives the SSD more time (+5% over the simple
+guess at the same traffic). Per layer the GPU needs ~1.5 ms but the SSD ~2.1 ms, so the SSD stays the limit; more cache slots
+remain the biggest lever. `tools/record_traces.py` and `tools/train_predictor.py` build the file (`meta/predictor.npz`, 512 MB, not
+in the repo since it is derived from the model's activations): see "Training the predictor" below. Without it everything still works.
+
 These are single-machine, short-run numbers, not a benchmark suite. Speed depends on your
 SSD, memory bandwidth and the text being generated. `CLAUDE.md` has the full development
 log: what was measured, what helped, and what did not.
@@ -102,6 +123,19 @@ sets how long it thinks (default `medium`; the chat template's own default is `x
 `--show-markup` prints the raw token stream. Output is greedy by default; `--temp`, `--top-k` and `--top-p` sample.
 
 Lower `--cache-gb` if you need more free memory; it trades speed for headroom.
+
+### Training the predictor
+
+About 25 minutes and 10-15 GB of temporary disk for ~12k tokens (more text = a slightly better file):
+
+```bash
+.venv/bin/python tools/record_traces.py prefill traces/text  some.txt other.py ...  --tokens 2500   # every token of plain text
+.venv/bin/python tools/record_traces.py decode  traces/chat  prompts.txt                              # the model's own replies, one prompt per line
+.venv/bin/python tools/train_predictor.py --traces traces/text traces/chat --out meta/predictor.npz
+```
+
+Use text unlike your prompts as well (code, prose, notes). The last file of the first trace set is held out to choose the
+regularization and calibrate the confidence. `bench.py --prefetch-p 0.55` / `0.75` trades more SSD traffic for more early reads.
 
 ## Chat
 
@@ -231,6 +265,7 @@ the printer.
 | `src/chat_session.py` | multi-turn conversation with a persistent KV cache |
 | `src/cli_common.py` | arguments, model loading and output helpers shared by the two programs |
 | `run_stream.py` | one-shot generation with timing and cache statistics |
+| `tools/record_traces.py`, `tools/train_predictor.py` | record router inputs/choices and fit the learned prefetch predictor |
 | `bench.py` | one benchmark generation from a long prompt: speed, how lookups were served, SSD bytes and busy time, optional `iostat` |
 | `chat.py` | interactive chat |
 | `src/openai_server.py` | OpenAI-compatible HTTP server logic on top of `ChatSession` |

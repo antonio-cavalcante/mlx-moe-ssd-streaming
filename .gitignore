@@ -10,3 +10,4 @@ __pycache__/
 meta/config.json
 meta/model.safetensors.index.json
 meta/tensors.json
+meta/predictor.npz

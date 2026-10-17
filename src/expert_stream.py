@@ -237,6 +237,7 @@ class ExpertCache:
         self.pending = [dict() for _ in range(L)]  # expert -> (slot, futures): prefetch
         self.resid = {}  # layer -> last-token residual stream (set by prefetch hooks)
         self.prefetch_k = 0
+        self.predictor = None  # LearnedPredictor, else the next layer's router is applied to this layer's stream
         self.trace = None  # set to a list to record (layer, expert ids) of every decode step
         self.stats = dict(hits=0, misses=0, bytes_read=0, read_s=0.0, sync_s=0.0, calls=0,
                           fallback=0, stack_s=0.0, pf_issued=0, pf_used=0, pf_wasted=0,
@@ -336,7 +337,7 @@ class ExpertCache:
     def prefetch(self, l, ids):
         """Start background reads into free/oldest slots for experts not yet resident."""
         order, pend = self.order[l], self.pending[l]
-        ids = list(dict.fromkeys(int(x) for x in ids))
+        ids = list(dict.fromkeys(int(x) for x in ids if x >= 0))
         protect = set(ids)
         issued = 0
         for e in ids:
@@ -390,6 +391,51 @@ class ExpertCache:
         return out
 
 
+def margin_threshold(edges, probs, tau):
+    """Smallest score margin (score minus the 8th best score) whose calibrated chance of being in the
+    next layer's true top-8 is >= tau: -inf if every margin qualifies, +inf if none does."""
+    ok = np.nonzero(np.asarray(probs) >= tau)[0]
+    if len(ok) == 0:
+        return float("inf")
+    return float("-inf") if ok[0] == 0 else float(edges[ok[0] - 1])
+
+
+class LearnedPredictor:
+    """Per-layer linear map from layer l's router input to layer l+d's router logits (ridge regression,
+    started from that router itself), plus a calibration table that turns a score margin into the chance
+    that the expert really is among that layer's top-8. Only experts at or above `tau` are prefetched.
+    d = 1, and 2 when the file has the second set (more time for the SSD, less accurate).
+    Trained offline from recorded activations (tools/)."""
+
+    CANDIDATES = 16
+
+    def __init__(self, path, tau=0.65, lookahead=None):
+        z = np.load(path)
+        lookahead = lookahead or (2 if "V2" in z else 1)   # default: as far ahead as the file goes
+        self.sets = []                                    # per lookahead d: (weights, biases, margin thresholds)
+        for d, (v, e, p) in enumerate((("V", "edges", "p"), ("V2", "edges2", "p2")), start=1):
+            if d > lookahead:
+                break
+            if v not in z:
+                raise ValueError(f"{path} has no lookahead-{d} predictor")
+            V = mx.array(z[v])                            # [L-d, dim+1, num_experts] float16, last row = bias
+            dim = V.shape[1] - 1
+            self.sets.append(([V[l, :dim] for l in range(V.shape[0])], [V[l, dim] for l in range(V.shape[0])],
+                              [margin_threshold(z[e][l], z[p][l], tau) for l in range(V.shape[0])]))
+            self.nbytes = getattr(self, "nbytes", 0) + V.nbytes
+            mx.eval(self.sets[-1][0], self.sets[-1][1])
+        self.tau, self.lookahead = tau, lookahead
+
+    def __call__(self, d, l, r, router):
+        """Lazy [.., CANDIDATES] expert ids for layer l+d (-1 = not confident enough), best first."""
+        w, b, thr = self.sets[d - 1]
+        z = (r.astype(mx.float16) @ w[l] + b[l]).astype(mx.float32)
+        sc = mx.sigmoid(z * router.router_multiplier) + router.gate.e_score_correction_bias
+        order = mx.argsort(-sc, axis=-1)[..., :self.CANDIDATES].astype(mx.int32)
+        top = mx.take_along_axis(sc, order, axis=-1)
+        return mx.where(top - top[..., 7:8] >= thr[l], order, -1)
+
+
 class StreamingSwitchGLU(nn.Module):
     """Drop-in for SwitchGLU(x, indices) that pulls the needed experts from disk."""
 
@@ -408,6 +454,7 @@ class StreamingSwitchGLU(nn.Module):
         for (proj, kind), arr in zip(PIECES, self._slab):
             setattr(getattr(template, proj), kind, arr)
         object.__setattr__(self, "next_layer", None)  # set by enable_prefetch
+        object.__setattr__(self, "next_layer2", None)
         object.__setattr__(self, "ratio", None)
 
     def _run_stacked(self, xs, local_inds, group):
@@ -424,30 +471,36 @@ class StreamingSwitchGLU(nn.Module):
         return y
 
     def _predict(self):
-        """Lazy top-k expert ids for the NEXT layer, from this layer's residual stream.
+        """Lazy [(d, expert ids)] for layers l+d, from this layer's residual stream.
 
         `r` is what this layer's router saw: the residual stream normalized by this layer's
-        pre-feedforward norm. The next layer's router expects the same stream normalized by ITS
-        norm, which differs only by the per-channel gain ratio `self.ratio`."""
+        pre-feedforward norm. Without a learned predictor the next layer's router expects the same stream
+        normalized by ITS norm, which differs only by the per-channel gain ratio `self.ratio`."""
         nxt, r = self.next_layer, self.cache.resid.get(self.layer_idx)
         if nxt is None or r is None:
-            return None
+            return []
+        pr = self.cache.predictor
+        if pr is not None:
+            out = [(1, pr(1, self.layer_idx, r, nxt.mlp))]
+            if pr.lookahead >= 2 and self.next_layer2 is not None:
+                out.append((2, pr(2, self.layer_idx, r, self.next_layer2.mlp)))
+            return out
         moe = nxt.mlp
         sc = (r.astype(mx.float32) * self.ratio) @ moe.gate.weight.T
         sc = mx.sigmoid(sc * moe.router_multiplier) + moe.gate.e_score_correction_bias
         k = min(self.cache.prefetch_k, sc.shape[-1])
-        return mx.argpartition(-sc, kth=k - 1, axis=-1)[..., :k]
+        return [(1, mx.argpartition(-sc, kth=k - 1, axis=-1)[..., :k])]
 
     def __call__(self, x, indices):
         cache, st = self.cache, self.cache.stats
         n_tok = int(np.prod(indices.shape[:-1]))
         speculate = cache.prefetch_k > 0 and n_tok <= self.admit_max_tokens
         t = time.perf_counter()
-        pred = self._predict() if speculate else None
+        pred = self._predict() if speculate else []
         st["predict_s"] += time.perf_counter() - t
         t = time.perf_counter()
         # Also flushes the previous layers' pending GPU work.
-        mx.eval(indices) if pred is None else mx.eval(indices, pred)
+        mx.eval(indices, *[p for _, p in pred])
         st["sync_s"] += time.perf_counter() - t
         st["calls"] += 1
         idx = np.array(indices)
@@ -466,9 +519,10 @@ class StreamingSwitchGLU(nn.Module):
             lut[uniq] = slots
             y = self._glu(xf, mx.array(lut[idxf]))
             if speculate:
-                if pred is not None:
+                if pred:
                     t = time.perf_counter()
-                    cache.prefetch(self.layer_idx + 1, np.array(pred).reshape(-1))
+                    for d, ids in pred:
+                        cache.prefetch(self.layer_idx + d, np.array(ids).reshape(-1))
                     st["pf_submit_s"] += time.perf_counter() - t
                 mx.async_eval(y)  # GPU starts the expert math now, overlapping the reads
             return y.reshape(*lead, k, -1)
@@ -512,15 +566,17 @@ def _gain_ratio(num, den):
     return mx.where(mx.abs(den) > 1e-6, num / mx.where(mx.abs(den) > 1e-6, den, 1.0), 0.0)
 
 
-def enable_prefetch(model, cache, k=4):
+def enable_prefetch(model, cache, k=4, predictor=None):
     """Predict layer l+1's experts during layer l and read them in the background."""
     cache.prefetch_k = k
+    cache.predictor = predictor
     layers = model.layers
     for i, layer in enumerate(layers):
         _hook_moe(layer.mlp, i, cache)
         nxt = layers[i + 1] if i + 1 < len(layers) else None
         glu = layer.mlp.experts
         object.__setattr__(glu, "next_layer", nxt)
+        object.__setattr__(glu, "next_layer2", layers[i + 2] if i + 2 < len(layers) else None)
         if nxt is not None:
             ratio = _gain_ratio(nxt.pre_feedforward_layernorm.weight, layer.pre_feedforward_layernorm.weight)
             mx.eval(ratio)
@@ -535,13 +591,14 @@ def split_slots(total, num_layers, weights=None):
 
 def build_streaming_model(model_dir, cache_gb=None, slots_per_layer=None, layer_weights=None, group_max=48,
                           nocache=True, threads=24, reserve_gb=10.0, prefetch_k=0, prefetch_threads=16,
-                          verbose=True):
+                          predictor=None, prefetch_p=0.65, lookahead=None, verbose=True):
     """Load mlx-lm's `muse_spark` with the dense weights resident and the experts streamed.
 
     The expert slabs get `slots_per_layer` slots per layer (an int or a list), or, by
     default, `cache_gb` worth of slots split over the layers (`layer_weights` = relative
     shares, default equal). cache_gb=None sizes it from the GPU's recommended working set.
-    prefetch_k>0 turns on speculative next-layer reads (top-k predicted experts).
+    prefetch_k>0 turns on speculative next-layer reads: the top-k experts the next router would pick, or,
+    with a `predictor` file (see LearnedPredictor), the experts it is at least `prefetch_p` sure about.
     """
     model_dir = Path(model_dir)
     # lazy=True: nothing is read yet. Without a vision_config the model has no vision tower (text only)
@@ -553,6 +610,8 @@ def build_streaming_model(model_dir, cache_gb=None, slots_per_layer=None, layer_
     store = ExpertStore(model_dir, n_layers, n_experts, nocache=nocache, threads=threads,
                         prefetch_threads=prefetch_threads)
     resident = sum(v.nbytes for k, v in tree_flatten(model.parameters()) if not _EXPERT_RE.match(k))
+    pred = LearnedPredictor(predictor, prefetch_p, lookahead) if predictor and prefetch_k > 0 else None
+    resident += pred.nbytes if pred else 0
     if slots_per_layer is None:
         if cache_gb is None:
             info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
@@ -578,11 +637,12 @@ def build_streaming_model(model_dir, cache_gb=None, slots_per_layer=None, layer_
         del old, qs
     mx.eval(model.parameters())  # the dense weights; the experts left the model above and are never read
     if prefetch_k > 0:
-        enable_prefetch(model, cache, prefetch_k)
+        enable_prefetch(model, cache, prefetch_k, pred)
     if verbose:
         total = n_layers * n_experts
         print(f"resident {resident / GB:.1f} GB, expert slabs {cache.capacity * store.expert_bytes / GB:.1f} GB "
               f"({cache.capacity} of {total} experts, {min(cache.slots)}-{max(cache.slots)} per layer, "
               f"{store.expert_bytes / 2**20:.1f} MB each)"
-              + (f", prefetch top-{prefetch_k}" if prefetch_k else ""), file=sys.stderr, flush=True)
+              + ((f", prefetch learned P>={prefetch_p}, {pred.lookahead} layer(s) ahead" if pred else f", prefetch top-{prefetch_k}") if prefetch_k else ""),
+              file=sys.stderr, flush=True)
     return model, cache
